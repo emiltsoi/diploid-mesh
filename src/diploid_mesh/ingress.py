@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from diploid_agent.transport.ingress import IngressHandler
@@ -48,7 +49,7 @@ class DiploidMeshIngress(IngressHandler):
             chat_id=chat_id,
             reason="mesh",
             priority=1,
-            scheduled_at=__import__("time").time(),
+            scheduled_at=time.time(),
             payload={
                 "user_message": display_text,
                 "mesh": {
