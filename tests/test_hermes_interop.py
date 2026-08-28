@@ -13,9 +13,7 @@ Marked @pytest.mark.fleet (fleet interop suite).
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
 import socket
 import sys
 import threading
@@ -72,8 +70,14 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
     """hermes-mesh (stub gateway) sends -> diploid wakes -> replies -> routed."""
     # ── diploid side (receiver) ─────────────────────────────────────────
     from diploid_agent.config import (
-        Config, DiploidConfig, HarnessConfig, MeshConfig, PersonaConfig,
-        PlanConfig, Secrets, TimerConfig,
+        Config,
+        DiploidConfig,
+        HarnessConfig,
+        MeshConfig,
+        PersonaConfig,
+        PlanConfig,
+        Secrets,
+        TimerConfig,
     )
     from diploid_agent.runtime.agent_runtime import AgentRuntime
     from diploid_agent.transport.http import create_app
@@ -171,14 +175,12 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
 
     try:
         # ── hermes side (sender): session_relay outbound delivery ───────
-        # INTEROP FINDING: hermes-mesh _deliver_webhook POSTs a RAW envelope
-        # body + signature headers; diploid /mesh/receive expects a JSON body
-        # {"text": <envelope>, "from": <sender>} + timestamp/signature headers.
-        # The wire formats DIFFER — that's the interop gap this test exposes.
-        # To prove the interop CAN work, deliver the diploid-expected JSON
-        # shape directly (the hermes-mesh delivery path needs a compat shim).
+        # INTEROP FINDING: hermes-mesh now defaults to the same JSON wire shape
+        # {"text": <envelope>, "from": <sender>} + X-Mesh-Timestamp + signature.
+        # diploid /mesh/receive always verifies timestamp\n<body>, so the signer
+        # must include the timestamp in the signed payload (MESH_SIGN_TIMESTAMP
+        # default-on for the JSON wire). This test builds that exact payload.
         import json as _json
-        import base64 as _b64
         import urllib.request as _urlreq
 
         body_json = _json.dumps(
