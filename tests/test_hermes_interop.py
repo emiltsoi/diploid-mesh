@@ -14,6 +14,7 @@ Marked @pytest.mark.fleet (fleet interop suite).
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import sys
 import threading
@@ -25,14 +26,18 @@ import pytest
 logger = logging.getLogger(__name__)
 
 # ── hermes-mesh on the stub gateway ─────────────────────────────────────
-_HERMES_MESH = Path.home() / "CascadeProjects" / "hermes-mesh"
+_HERMES_MESH = Path(os.environ.get("HERMES_MESH_PATH", Path.home() / "CascadeProjects" / "hermes-mesh"))
 _STUBS = _HERMES_MESH / "tests" / "stubs"
-if str(_STUBS) not in sys.path:
-    sys.path.insert(0, str(_STUBS))
-if str(_HERMES_MESH) not in sys.path:
-    sys.path.insert(0, str(_HERMES_MESH))
+if _HERMES_MESH.exists():
+    if str(_STUBS) not in sys.path:
+        sys.path.insert(0, str(_STUBS))
+    if str(_HERMES_MESH) not in sys.path:
+        sys.path.insert(0, str(_HERMES_MESH))
 
-pytestmark = pytest.mark.fleet
+pytestmark = [
+    pytest.mark.fleet,
+    pytest.mark.skipif(not _HERMES_MESH.exists(), reason="HERMES_MESH_PATH not found"),
+]
 
 
 def _free_port() -> int:
@@ -119,9 +124,7 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
         diploid=DiploidConfig(bin="/bin/echo", model="swe-1-7"),
         persona=PersonaConfig(
             name="test-pilot",
-            profile_root=Path(
-                str(Path(__file__).parent / "fixtures" / "test-pilot")
-            ),
+            profile_root=Path(__file__).parent / "fixtures" / "test-pilot",
         ),
         harness=HarnessConfig(
             sessions_root=tmp_path / "sessions",
