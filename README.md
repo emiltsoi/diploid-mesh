@@ -96,6 +96,27 @@ Fleet interop tests (require a running Hermes gateway) are marked with `pytest.m
 python -m pytest -m fleet
 ```
 
+## Cross-harness mesh
+
+The mesh is one protocol shared by three runtimes:
+
+- **Hermes** agents use [`hermes-mesh`](https://github.com/emiltsoi/hermes-mesh), which adds a `mesh` platform adapter and `mesh_send`/`mesh_list` tools.
+- **OpenClaw** agents use [`openclaw-mesh`](https://github.com/emiltsoi/openclaw-mesh), a plugin that receives `[mesh]` webhooks and injects them as agent turns.
+- **diploid-agent** agents use [`diploid-mesh`](https://github.com/emiltsoi/diploid-mesh) (this repo), a state plugin that exposes the same envelope and MCP tools over the diploid harness.
+
+All three use the same `mesh-peer-registry` server and the same on-disk vault format (`mesh/agents/<name>/identity.yaml`), so a Hermes agent can `mesh_send` to a diploid agent, and a diploid agent can reply to an OpenClaw agent, without a custom translator.
+
+```
+Hermes fleet        mesh-peer-registry       OpenClaw          diploid-agent
+   │                        │                  │                  │
+   │  [mesh] + Ed25519 sig  │                  │  [mesh] + sig    │
+   └────────────webhook─────┼──────────────────┼────────────────▶│
+                            │  public keys /   │                  │
+                            │  peer URLs       │                  │
+```
+
+The registry is optional for loopback-only fleets — a shared file-based vault (`~/.mesh/agents`) is enough — but it makes multi-host discovery simple.
+
 ## Project links
 
 - Source: <https://github.com/emiltsoi/diploid-mesh>
