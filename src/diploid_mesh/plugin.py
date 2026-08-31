@@ -87,6 +87,10 @@ class DiploidMeshPlugin(StatePlugin):
             env.append(f"MESH_REGISTRY_URL={mesh.registry_url}")
         if mesh.private_key_path:
             env.append(f"MESH_PRIVATE_KEY_PATH={mesh.private_key_path}")
+        if mesh.max_sends_per_turn is not None:
+            env.append(f"MESH_MAX_SENDS_PER_TURN={mesh.max_sends_per_turn}")
+        if mesh.max_message_in_turn_suggestion is not None:
+            env.append(f"MESH_MAX_MESSAGE_IN_TURN_SUGGESTION={mesh.max_message_in_turn_suggestion}")
 
         return McpServerConfig(
             name="diploid-mesh",
@@ -98,6 +102,10 @@ class DiploidMeshPlugin(StatePlugin):
                 "{chat_id}",
                 "--sessions-root",
                 "{sessions_root}",
+                "--state-file",
+                "chat_mesh_state.json",
+                "--harness-url",
+                "{harness_url}",
             ],
             env=env,
         )
@@ -108,15 +116,24 @@ class DiploidMeshPlugin(StatePlugin):
             # Still provide the contract block so the agent knows how to mesh.
             block = mesh_prompt_block()
         else:
+            reply = mesh.get("reply", "no")
             lines = [
                 mesh_prompt_block(),
                 "",
                 f"## Active mesh message from `{mesh.get('sender', 'unknown')}`",
                 f"- action: `{mesh.get('action', 'info')}`",
-                f"- reply expected: `{mesh.get('reply', 'no')}`",
+                f"- reply expected: `{reply}`",
             ]
             if mesh.get("ref"):
                 lines.append(f"- ref: `{mesh['ref']}`")
+            if reply == "no":
+                lines.append(
+                    "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."
+                )
+            if reply == "end":
+                lines.append(
+                    "- **The sender has ended this thread. Do NOT send a mesh reply.**"
+                )
             body = mesh.get("body") or ""
             if body:
                 lines.append(f"\nMessage body: {body}")

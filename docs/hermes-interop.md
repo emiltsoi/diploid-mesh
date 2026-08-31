@@ -91,6 +91,9 @@ be launched without a Hermes gateway instance.
   config (do not commit that to production).
 - Set `harness.mesh.rate_limit_per_minute: 0` (disabled) for the test, or keep
   Hermes's `MESH_RATE_LIMIT_PER_MINUTE` low.
+- Use `reply=end` to close a thread; `reply=no` for one-way status; `reply=yes`
+  only when a response is needed. The MCP server will nudge and then hard-cap
+  sends per turn.
 - Point Hermes `target_session` at a single test DM/chat, not a public channel.
 - Use a private `mesh-peer-registry` or isolated vault so the interop does not
   publish to a public registry.

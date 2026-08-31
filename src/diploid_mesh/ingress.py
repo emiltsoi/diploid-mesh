@@ -41,6 +41,39 @@ class DiploidMeshIngress(IngressHandler):
         chat_id = self.mesh.resolve_chat_id(envelope.sender)
         display_text = self._display_text(envelope)
 
+        is_dsn = (envelope.body or "").startswith("[mesh-dsn]")
+
+        mesh_payload = {
+            "sender": envelope.sender,
+            "recipient": envelope.recipient,
+            "action": envelope.action,
+            "reply": envelope.reply,
+            "ref": envelope.ref,
+            "message_id": envelope.msg_id,
+        }
+
+        # DSNs are terminal: record without a model turn.
+        if is_dsn:
+            try:
+                await run_in_threadpool(
+                    self.runtime.record_mesh_message,
+                    chat_id,
+                    display_text,
+                    mesh_payload,
+                )
+            except Exception:
+                logger.exception("[diploid-mesh] failed to record DSN")
+                return JSONResponse(
+                    {"status": "error", "reason": "failed to record DSN"},
+                    status_code=500,
+                )
+            return JSONResponse(
+                {"status": "accepted", "delivery_id": envelope.msg_id, "chat_id": chat_id},
+                status_code=202,
+            )
+
+        # reply=yes, reply=no, and reply=end all wake a real ACP turn.
+        # The MCP server enforces different send budgets based on current_mesh.reply.
         from diploid_agent.models import WakeEvent
 
         event_id = f"mesh:{envelope.msg_id}"
@@ -50,17 +83,7 @@ class DiploidMeshIngress(IngressHandler):
             reason="mesh",
             priority=1,
             scheduled_at=time.time(),
-            payload={
-                "user_message": display_text,
-                "mesh": {
-                    "sender": envelope.sender,
-                    "recipient": envelope.recipient,
-                    "action": envelope.action,
-                    "reply": envelope.reply,
-                    "ref": envelope.ref,
-                    "message_id": envelope.msg_id,
-                },
-            },
+            payload={"user_message": display_text, "mesh": mesh_payload},
             silent=False,
             ready=True,
         )
@@ -83,6 +106,9 @@ class DiploidMeshIngress(IngressHandler):
                 {"status": "queued", "delivery_id": envelope.msg_id},
                 status_code=202,
             )
+
+        # Mark the wake as complete so the waker does not retry it.
+        self.runtime.wake_queue.complete(event_id)
 
         return JSONResponse(
             {"status": "accepted", "delivery_id": envelope.msg_id, "chat_id": chat_id},

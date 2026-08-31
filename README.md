@@ -10,7 +10,8 @@ Bidirectional mesh integration for [diploid-agent](https://github.com/emiltsoi/d
 - Receives Ed25519-signed `[mesh]` webhooks on `/mesh/receive` (and the OpenClaw alias `/plugins/openclaw-mesh/webhook`).
 - Wakes the diploid runtime with mesh context so the agent can reply.
 - Exposes MCP tools (`mesh_send`, `mesh_list`, `mesh_register`, `mesh_sync`, `mesh_publish`, `mesh_health`, `mesh_deregister`).
-- Enforces the mesh contract: replay windows, `THREAD_CLOSED`, DSN exemption, and `reply=end` terminal semantics.
+- Enforces the mesh contract: replay windows, `THREAD_CLOSED`, DSN exemption, and `reply` semantics.
+- Nudges and hard-caps `mesh_send` calls per ACP turn.
 - Stores per-chat mesh state (`chat_mesh_state.json`) and a prompt block teaching the agent the CTA contract.
 - Relies on [`mesh-peer-registry`](https://github.com/emiltsoi/mesh-peer-registry) for shared envelope parsing, identity, crypto, and registry primitives.
 
@@ -30,6 +31,21 @@ pip install diploid-mesh
 pip install -e /path/to/mesh-peer-registry
 pip install -e /path/to/diploid-mesh
 ```
+
+## Message lifecycle
+
+- `reply=yes` (default): the recipient runs an ACP turn and may respond. The MCP server nudges the model to use `reply=end` after `max_message_in_turn_suggestion` sends and hard-blocks at `max_sends_per_turn`.
+- `reply=no`: the recipient runs an ACP turn to perform work. The prompt says "only reply in an exceptional case," and the MCP server gives the same nudge/cap as `reply=yes` but the model is expected to avoid sending.
+- `reply=end`: the recipient runs an ACP turn but the MCP server hard-blocks all `mesh_send` calls; this is the last message in the thread.
+- DSNs (`[mesh-dsn]` body prefix): delivery-status notifications are recorded, not replied to, and do not start a turn.
+
+## Per-turn send cap
+
+`harness.mesh.max_sends_per_turn` hard-limits how many `mesh_send` calls the agent can make within a single active ACP turn. The default is `3`.
+
+`harness.mesh.max_message_in_turn_suggestion` is a soft nudge threshold. After that many `mesh_send` calls, the tool result appends a note suggesting the next send use `reply=end` to close the thread. This lets the LLM infer the graceful close.
+
+`reply=end` always overrides the cap to `0`, blocking all `mesh_send` for that turn.
 
 ## Configure diploid-agent
 

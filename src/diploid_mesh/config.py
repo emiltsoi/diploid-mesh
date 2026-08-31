@@ -41,3 +41,11 @@ class DiploidMeshConfig:
     @property
     def route(self) -> str:
         return self.config.route
+
+    @property
+    def max_sends_per_turn(self) -> int:
+        return self.config.max_sends_per_turn
+
+    @property
+    def max_message_in_turn_suggestion(self) -> int:
+        return self.config.max_message_in_turn_suggestion

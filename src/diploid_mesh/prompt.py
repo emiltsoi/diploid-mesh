@@ -17,8 +17,8 @@ A `[mesh]` message looks like:
 
 - `action=do` — the sender is asking you to do something. You should decide whether to act and reply.
 - `action=info` — the sender is telling you something. You do not need to reply unless `reply=yes`.
-- `reply=yes` — the sender expects a response.
-- `reply=no` — the sender does not expect a response.
+- `reply=yes` — the sender expects a response. Avoid long threads: close with `reply=end` when you are done.
+- `reply=no` — the sender does not expect a response. Do the work, but send a mesh reply only in an exceptional case.
 - `reply=end` — terminal message. You must NOT reply. Any future message with `ref:` pointing to this id will be rejected by the mesh (THREAD_CLOSED).
 - `ref:<uuid>` — references a prior message id in the same thread.
 

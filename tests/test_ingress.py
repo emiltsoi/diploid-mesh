@@ -17,6 +17,7 @@ from diploid_agent.config import (
     Secrets,
     TimerConfig,
 )
+from diploid_agent.models import ChatResult
 from diploid_agent.runtime.agent_runtime import AgentRuntime
 from diploid_agent.transport.http import create_app
 from fastapi.testclient import TestClient
@@ -77,6 +78,9 @@ def _sign_and_send(
     public_pem: str,
     sender_identity: dict,
     vault_path: Path,
+    reply: str = "yes",
+    is_dsn: bool = False,
+    msg_id: str = "msg-1",
 ) -> None:
     # Write sender identity into the vault so the receiver can verify.
     sender_dir = vault_path / "mesh" / "agents" / sender
@@ -107,9 +111,9 @@ def _sign_and_send(
     envelope = MeshEnvelope(
         sender=sender,
         recipient=recipient,
-        msg_id="msg-1",
+        msg_id=msg_id,
         action="do",
-        reply="yes",
+        reply=reply,
         body=body,
     )
     text = envelope.build()
@@ -118,14 +122,18 @@ def _sign_and_send(
     signed = f"{ts}\n{body_json}".encode()
     signature = sign_message(private_pem, signed)
 
+    headers = {
+        "X-Mesh-Timestamp": ts,
+        "X-Mesh-Signature": signature,
+        "Content-Type": "application/octet-stream",
+    }
+    if is_dsn:
+        headers["X-Mesh-Dsn"] = "1"
+
     return client.post(
         "/mesh/receive",
         data=body_json.encode(),
-        headers={
-            "X-Mesh-Timestamp": ts,
-            "X-Mesh-Signature": signature,
-            "Content-Type": "application/octet-stream",
-        },
+        headers=headers,
     )
 
 
@@ -139,6 +147,17 @@ def client(tmp_path: Path):
     runtime.engine = FakeEngine()
     with TestClient(create_app(config, runtime)) as client:
         yield client
+
+
+@pytest.fixture
+def client_runtime(tmp_path: Path):
+    config = _make_config(tmp_path)
+    config.harness.mesh.vault_path = tmp_path / "mesh-vault"
+    config.harness.mesh.private_key_path = tmp_path / "diploid-0.pem"
+    runtime = AgentRuntime(config)
+    runtime.engine = FakeEngine()
+    with TestClient(create_app(config, runtime)) as client:
+        yield client, runtime
 
 
 def test_mesh_receive_triggers_wake(tmp_path: Path, client: TestClient) -> None:
@@ -157,3 +176,95 @@ def test_mesh_receive_triggers_wake(tmp_path: Path, client: TestClient) -> None:
     body = resp.json()
     assert body["status"] == "accepted"
     assert body["chat_id"] == "mesh:hermes-0"
+
+
+def test_mesh_receive_reply_classifications(
+    tmp_path: Path, client_runtime: tuple[TestClient, AgentRuntime], monkeypatch
+) -> None:
+    client, runtime = client_runtime
+    private, public = generate_keypair()
+    vault_path = tmp_path / "mesh-vault"
+
+    spy = {"record": None, "wake": None}
+
+    def record_mock(*a, **k):
+        spy["record"] = (a, k)
+
+    def wake_mock(*a, **k):
+        spy["wake"] = (a, k)
+        return ChatResult(reply="ok")
+
+    monkeypatch.setattr(runtime, "record_mesh_message", record_mock)
+    monkeypatch.setattr(runtime, "wake", wake_mock)
+
+    # reply=yes wakes a turn.
+    resp = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "Hello",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault_path,
+        reply="yes",
+        msg_id="msg-yes",
+    )
+    assert resp.status_code == 202
+    assert spy["wake"] is not None
+    spy["record"] = None
+    spy["wake"] = None
+
+    # reply=no still wakes a turn.
+    resp = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "Update",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault_path,
+        reply="no",
+        msg_id="msg-no",
+    )
+    assert resp.status_code == 202
+    assert spy["wake"] is not None
+    spy["record"] = None
+    spy["wake"] = None
+
+    # reply=end still wakes a turn (MCP will block mesh_send).
+    resp = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "Done",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault_path,
+        reply="end",
+        msg_id="msg-end",
+    )
+    assert resp.status_code == 202
+    assert spy["record"] is None
+    assert spy["wake"] is not None
+    spy["record"] = None
+    spy["wake"] = None
+
+    # DSN is terminal: record only, no wake.
+    resp = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "[mesh-dsn] delivered",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault_path,
+        is_dsn=True,
+        msg_id="msg-dsn",
+    )
+    assert resp.status_code == 202
+    assert spy["record"] is not None
+    assert spy["wake"] is None

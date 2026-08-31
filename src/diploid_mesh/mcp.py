@@ -10,12 +10,119 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from diploid_mesh.config import DiploidMeshConfig
 from diploid_mesh.core import DiploidMesh
 
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 logger = logging.getLogger(__name__)
+
+
+class MeshSendTracker:
+    """Nudge + hard-cap mesh_send calls per active ACP turn.
+
+    Reads `current_mesh.reply` from the plugin state file. If it is `end`,
+    all mesh_send calls are blocked. Otherwise the agent gets a soft
+    suggestion after `max_message_in_turn_suggestion` sends and a hard
+    block after `max_sends_per_turn`.
+    """
+
+    def __init__(
+        self,
+        chat_id: str,
+        harness_url: str,
+        state_path: Path,
+        api_key: str | None,
+        max_sends: int,
+        max_message_in_turn_suggestion: int,
+    ) -> None:
+        self.chat_id = chat_id
+        self.harness_url = harness_url.rstrip("/") if harness_url else ""
+        self.state_path = state_path
+        self.api_key = api_key
+        self.max_sends = max(0, max_sends)
+        self.suggestion_threshold = max(0, max_message_in_turn_suggestion)
+        self._client: httpx.Client | None = None
+        self._turn_start: float | None = None
+        self._count = 0
+
+    def _client_or_none(self) -> httpx.Client | None:
+        if not self.harness_url:
+            return None
+        if self._client is None:
+            self._client = httpx.Client(base_url=self.harness_url, timeout=5.0)
+        return self._client
+
+    def _turn_status(self) -> dict[str, Any] | None:
+        client = self._client_or_none()
+        if client is None:
+            return None
+        headers = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            resp = client.get(f"/turn/{self.chat_id}", params={"wait": "0"}, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            logger.exception("MeshSendTracker failed to query /turn/%s", self.chat_id)
+        return None
+
+    def _current_mesh_reply(self) -> str | None:
+        """Read current_mesh.reply from the plugin state file, if present."""
+        if not self.state_path.exists():
+            return None
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            mesh = data.get("current_mesh") or {}
+            return mesh.get("reply")
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _nudge(self, count: int, cap: int) -> str | None:
+        if cap > 0 and count >= self.suggestion_threshold and count <= cap:
+            if count == cap:
+                return (
+                    "This is the last mesh_send allowed this turn. "
+                    "If you are done, use reply=end to close the thread."
+                )
+            return (
+                f"You have sent {count} mesh message(s) this turn. "
+                "If you are done, use reply=end on the next send to close the thread."
+            )
+        return None
+
+    def allowed(self) -> tuple[bool, str | None]:
+        # The reply value lives on disk and is available even if the harness
+        # is unreachable. reply=end is an absolute block.
+        incoming_reply = self._current_mesh_reply()
+        if incoming_reply == "end":
+            return False, "This message has reply=end; do not send a mesh reply."
+
+        status = self._turn_status()
+        if status is None:
+            status = {}
+
+        if status.get("status") != "running":
+            self._count = 0
+            self._turn_start = None
+            return True, None
+
+        turn_start = status.get("start_time")
+        if turn_start != self._turn_start:
+            self._count = 0
+            self._turn_start = turn_start
+
+        # reply=yes / reply=no share the same cap, but the prompt tells the
+        # agent to avoid replying for reply=no. The hard cap is the backstop.
+        cap = self.max_sends
+        self._count += 1
+        if cap > 0 and self._count > cap:
+            return False, f"Mesh send budget ({cap}) exceeded for this turn."
+
+        return True, self._nudge(self._count, cap)
 
 
 def _error_response(req_id: Any, message: str) -> dict[str, Any]:
@@ -40,8 +147,21 @@ def _tool_result(req_id: Any, text: str, is_error: bool = False) -> dict[str, An
 class DiploidMeshMcpServer:
     """Minimal stdio MCP server backed by DiploidMesh."""
 
-    def __init__(self, config: DiploidMeshConfig) -> None:
+    def __init__(self, config: DiploidMeshConfig, args: argparse.Namespace) -> None:
         self.mesh = DiploidMesh(config)
+        self.chat_id = args.chat_id
+        state_dir = Path(args.sessions_root) / args.chat_id.replace("/", "_")
+        state_path = state_dir / (args.state_file or "chat_mesh_state.json")
+        self.tracker = MeshSendTracker(
+            chat_id=args.chat_id,
+            harness_url=args.harness_url or os.getenv("HARNESS_URL", ""),
+            state_path=state_path,
+            api_key=os.getenv("HARNESS_API_KEY"),
+            max_sends=int(os.getenv("MESH_MAX_SENDS_PER_TURN", "3")),
+            max_message_in_turn_suggestion=int(
+                os.getenv("MESH_MAX_MESSAGE_IN_TURN_SUGGESTION", "2")
+            ),
+        )
 
     def _tools(self) -> list[dict[str, Any]]:
         return [
@@ -161,6 +281,10 @@ class DiploidMeshMcpServer:
                     return _tool_result(req_id, text)
 
                 if name == "mesh_send":
+                    ok, hint = self.tracker.allowed()
+                    if not ok:
+                        return _tool_result(req_id, f"Mesh send blocked: {hint}", is_error=True)
+
                     result = self.mesh.send(
                         recipient=arguments["agent"],
                         body=arguments["message"],
@@ -172,7 +296,10 @@ class DiploidMeshMcpServer:
                         return _tool_result(
                             req_id, f"Delivery failed: {result.error}", is_error=True
                         )
-                    return _tool_result(req_id, f"Delivered: {result.delivery_id}")
+                    out = f"Delivered: {result.delivery_id}"
+                    if hint:
+                        out = f"{out}\n\nNote: {hint}"
+                    return _tool_result(req_id, out)
 
                 if name == "mesh_register":
                     result = self.mesh.register(
@@ -258,14 +385,11 @@ def main() -> None:
     parser.add_argument("--chat-id", required=True)
     parser.add_argument("--sessions-root", required=True)
     parser.add_argument("--state-file", default="chat_mesh_state.json")
+    parser.add_argument("--harness-url", default="")
     args = parser.parse_args()
 
-    # args.sessions_root is currently unused; the MCP process is stateless.
-    # It is accepted for forward-compatibility with per-chat state files.
-    _ = args.sessions_root
-
     mesh_config = _mesh_config_from_env()
-    server = DiploidMeshMcpServer(mesh_config)
+    server = DiploidMeshMcpServer(mesh_config, args)
     server.run()
 
 
