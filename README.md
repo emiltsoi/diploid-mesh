@@ -12,6 +12,8 @@ Bidirectional mesh integration for [diploid-agent](https://github.com/emiltsoi/d
 - Exposes MCP tools (`mesh_send`, `mesh_list`, `mesh_register`, `mesh_sync`, `mesh_publish`, `mesh_health`, `mesh_deregister`).
 - Enforces the mesh contract: replay windows, `THREAD_CLOSED`, DSN exemption, and `reply` semantics.
 - Nudges and hard-caps `mesh_send` calls per ACP turn.
+- Strengthens prompt discipline with a top-of-prompt `SYSTEM — MESH REPLY RULE` CTA that commands the agent to use `mesh_send` and keep mesh traffic out of normal assistant text.
+- Mirrors sent mesh messages to Telegram as `System: [mesh] ...` notices when `harness.notifications.mesh_telegram_float` is enabled.
 - Stores per-chat mesh state (`chat_mesh_state.json`) and a prompt block teaching the agent the CTA contract.
 - Relies on [`mesh-peer-registry`](https://github.com/emiltsoi/mesh-peer-registry) for shared envelope parsing, identity, crypto, and registry primitives.
 
@@ -72,7 +74,44 @@ harness:
       prompt_order: 50
       max_prompt_chars: 4096
       state_file: chat_mesh_state.json
+      mcp_server:
+        name: diploid-mesh
+        command: python
+        args:
+          - -m
+          - diploid_mesh.mcp
+          - --chat-id
+          - '{chat_id}'
+          - --sessions-root
+          - '{sessions_root}'
+          - --harness-url
+          - '{harness_url}'
+        env:
+          - MESH_AGENT_NAME=diploid-0
+          - MESH_PRIVATE_KEY_PATH=/home/diploid/.mesh/keys/diploid-0.pem
+          - MESH_VAULT_PATH=/home/diploid/.mesh
 ```
+
+The `diploid-mesh` MCP server must be able to call back to the harness URL. The
+`--harness-url` argument is required if it is not passed via the `HARNESS_URL`
+environment variable (newer `diploid-agent` versions inject `HARNESS_URL`
+automatically for all MCP children).
+
+## Floating mesh messages to Telegram
+
+Set in `runtime-overrides.yaml` (or live via `/config`):
+
+```yaml
+notifications:
+  enabled: true
+  outbox_delivery: true
+  mesh_telegram_float: true
+```
+
+After every successful `mesh_send`, a system message such as
+`System: [mesh] diploid-0 → hermes-0: pong (action=info) (reply=end) (id=...)`
+is delivered to the sender's Telegram chat, so the human operator sees the mesh
+traffic without the agent leaking it into assistant text.
 
 ## Prepare the vault
 
