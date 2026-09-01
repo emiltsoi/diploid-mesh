@@ -268,3 +268,21 @@ def test_mesh_receive_reply_classifications(
     assert resp.status_code == 202
     assert spy["record"] is not None
     assert spy["wake"] is None
+    spy["record"] = None
+
+    # DSN header alone (no body prefix) is also terminal.
+    resp = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "delivered",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault_path,
+        is_dsn=True,
+        msg_id="msg-dsn-header",
+    )
+    assert resp.status_code == 202
+    assert spy["record"] is not None
+    assert spy["wake"] is None

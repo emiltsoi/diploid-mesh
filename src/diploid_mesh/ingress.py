@@ -41,7 +41,7 @@ class DiploidMeshIngress(IngressHandler):
         chat_id = self.mesh.resolve_chat_id(envelope.sender)
         display_text = self._display_text(envelope)
 
-        is_dsn = (envelope.body or "").startswith("[mesh-dsn]")
+        is_dsn = (envelope.body or "").startswith("[mesh-dsn]") or self._is_dsn_header(headers)
 
         mesh_payload = {
             "sender": envelope.sender,
@@ -114,6 +114,11 @@ class DiploidMeshIngress(IngressHandler):
             {"status": "accepted", "delivery_id": envelope.msg_id, "chat_id": chat_id},
             status_code=202,
         )
+
+    @staticmethod
+    def _is_dsn_header(headers: dict[str, str]) -> bool:
+        value = headers.get("x-mesh-dsn", "").lower()
+        return value in ("1", "true", "yes")
 
     def _display_text(self, envelope) -> str:
         body = envelope.body or ""
