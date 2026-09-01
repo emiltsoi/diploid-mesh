@@ -55,6 +55,42 @@ class MeshSendTracker:
             self._client = httpx.Client(base_url=self.harness_url, timeout=5.0)
         return self._client
 
+    def notify_telegram(
+        self,
+        sender: str,
+        recipient: str,
+        body: str,
+        action: str,
+        reply: str,
+        msg_id: str,
+    ) -> None:
+        """Float a successfully sent mesh message to Telegram as a system notice.
+
+        This call is fire-and-forget: a failure is logged but does not break the
+        mesh tool result.
+        """
+        client = self._client_or_none()
+        if client is None:
+            return
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            client.post(
+                f"/mesh/{self.chat_id}/notify",
+                json={
+                    "sender": sender,
+                    "recipient": recipient,
+                    "body": body,
+                    "action": action,
+                    "reply": reply,
+                    "msg_id": msg_id,
+                },
+                headers=headers,
+            )
+        except Exception:
+            logger.exception("Failed to float mesh send to Telegram for %s", self.chat_id)
+
     def _turn_status(self) -> dict[str, Any] | None:
         client = self._client_or_none()
         if client is None:
@@ -296,6 +332,14 @@ class DiploidMeshMcpServer:
                         return _tool_result(
                             req_id, f"Delivery failed: {result.error}", is_error=True
                         )
+                    self.tracker.notify_telegram(
+                        sender=self.mesh.core_config.agent_name,
+                        recipient=arguments["agent"],
+                        body=arguments["message"],
+                        action=arguments.get("action", "do"),
+                        reply=arguments.get("reply", "yes"),
+                        msg_id=result.delivery_id or "",
+                    )
                     out = f"Delivered: {result.delivery_id}"
                     if hint:
                         out = f"{out}\n\nNote: {hint}"

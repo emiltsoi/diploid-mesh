@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from diploid_agent.config import (
@@ -14,14 +15,18 @@ from diploid_agent.config import (
     MeshConfig,
     PersonaConfig,
     PlanConfig,
+    PluginConfig,
     Secrets,
     TimerConfig,
 )
-from diploid_agent.models import ChatResult
+from diploid_agent.plugins.contexts import PromptContext
 from diploid_agent.runtime.agent_runtime import AgentRuntime
 from diploid_agent.transport.http import create_app
 from fastapi.testclient import TestClient
 from mesh_core import MeshEnvelope, generate_keypair, sign_message
+
+from diploid_mesh.mcp import MeshSendTracker
+from diploid_mesh.plugin import DiploidMeshPlugin
 
 
 class FakeEngine:
@@ -55,7 +60,7 @@ def _make_config(tmp_path: Path) -> Config:
             session_store_path=tmp_path / "sessions.jsonl",
             plan=PlanConfig(root=tmp_path / "plans"),
             memory={"backend": "file"},  # type: ignore[arg-type]
-            timer=TimerConfig(enabled=True, interval_seconds=0.1),
+            timer=TimerConfig(enabled=False, interval_seconds=0.1),
             mesh=MeshConfig(
                 enabled=True,
                 agent_name="diploid-0",
@@ -185,104 +190,149 @@ def test_mesh_receive_reply_classifications(
     private, public = generate_keypair()
     vault_path = tmp_path / "mesh-vault"
 
-    spy = {"record": None, "wake": None}
+    spy = {"record": None}
 
     def record_mock(*a, **k):
         spy["record"] = (a, k)
 
-    def wake_mock(*a, **k):
-        spy["wake"] = (a, k)
-        return ChatResult(reply="ok")
-
     monkeypatch.setattr(runtime, "record_mesh_message", record_mock)
-    monkeypatch.setattr(runtime, "wake", wake_mock)
 
-    # reply=yes wakes a turn.
-    resp = _sign_and_send(
-        client,
-        private,
-        "hermes-0",
-        "diploid-0",
-        "Hello",
-        public_pem=public,
-        sender_identity={},
-        vault_path=vault_path,
-        reply="yes",
-        msg_id="msg-yes",
-    )
-    assert resp.status_code == 202
-    assert spy["wake"] is not None
-    spy["record"] = None
-    spy["wake"] = None
-
-    # reply=no still wakes a turn.
-    resp = _sign_and_send(
-        client,
-        private,
-        "hermes-0",
-        "diploid-0",
-        "Update",
-        public_pem=public,
-        sender_identity={},
-        vault_path=vault_path,
-        reply="no",
-        msg_id="msg-no",
-    )
-    assert resp.status_code == 202
-    assert spy["wake"] is not None
-    spy["record"] = None
-    spy["wake"] = None
-
-    # reply=end still wakes a turn (MCP will block mesh_send).
-    resp = _sign_and_send(
-        client,
-        private,
-        "hermes-0",
-        "diploid-0",
-        "Done",
-        public_pem=public,
-        sender_identity={},
-        vault_path=vault_path,
-        reply="end",
-        msg_id="msg-end",
-    )
-    assert resp.status_code == 202
-    assert spy["record"] is None
-    assert spy["wake"] is not None
-    spy["record"] = None
-    spy["wake"] = None
+    for reply, msg_id in [("yes", "msg-yes"), ("no", "msg-no"), ("end", "msg-end")]:
+        resp = _sign_and_send(
+            client,
+            private,
+            "hermes-0",
+            "diploid-0",
+            f"Hello-{reply}",
+            public_pem=public,
+            sender_identity={},
+            vault_path=vault_path,
+            reply=reply,
+            msg_id=msg_id,
+        )
+        assert resp.status_code == 202
+        assert resp.json()["chat_id"] == "mesh:hermes-0"
+        assert spy["record"] is None
+        # The waker is disabled in this test, so the wake stays in the queue
+        # and the handler returns without running a turn.
+        event = runtime.wake_queue.get(f"mesh:{msg_id}")
+        assert event is not None, f"wake not enqueued for reply={reply}"
+        assert event.reason == "mesh"
+        assert event.payload["mesh"]["reply"] == reply
+        assert event.payload.get("silent") is False
+        spy["record"] = None
 
     # DSN is terminal: record only, no wake.
-    resp = _sign_and_send(
-        client,
-        private,
-        "hermes-0",
-        "diploid-0",
-        "[mesh-dsn] delivered",
-        public_pem=public,
-        sender_identity={},
-        vault_path=vault_path,
-        is_dsn=True,
-        msg_id="msg-dsn",
-    )
-    assert resp.status_code == 202
-    assert spy["record"] is not None
-    assert spy["wake"] is None
-    spy["record"] = None
+    for msg_id in ("msg-dsn", "msg-dsn-header"):
+        resp = _sign_and_send(
+            client,
+            private,
+            "hermes-0",
+            "diploid-0",
+            "[mesh-dsn] delivered" if msg_id == "msg-dsn" else "delivered",
+            public_pem=public,
+            sender_identity={},
+            vault_path=vault_path,
+            is_dsn=True,
+            msg_id=msg_id,
+        )
+        assert resp.status_code == 202
+        assert spy["record"] is not None
+        assert runtime.wake_queue.get(f"mesh:{msg_id}") is None
+        spy["record"] = None
 
-    # DSN header alone (no body prefix) is also terminal.
-    resp = _sign_and_send(
-        client,
-        private,
-        "hermes-0",
-        "diploid-0",
-        "delivered",
-        public_pem=public,
-        sender_identity={},
-        vault_path=vault_path,
-        is_dsn=True,
-        msg_id="msg-dsn-header",
+
+def _make_mesh_plugin(runtime: AgentRuntime, chat_id: str) -> DiploidMeshPlugin:
+    config = PluginConfig(
+        name="mesh",
+        module="diploid_mesh",
+        prompt_slot="mesh",
+        state_file="chat_mesh_state.json",
+        enabled=True,
     )
-    assert resp.status_code == 202
-    assert spy["record"] is not None
-    assert spy["wake"] is None
+    return DiploidMeshPlugin(
+        config, chat_id, runtime.sessions_root, runtime=runtime
+    )
+
+
+def test_mesh_prompt_after_prompt_built_adds_reply_cta(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    mesh_plugin._state["current_mesh"] = {
+        "sender": "hermes-0",
+        "body": "ping",
+        "reply": "yes",
+    }
+    pctx = PromptContext(
+        prompt="## Identity\n\n## User\nping",
+        notice=None,
+        memory_flags={},
+        slots={},
+    )
+    result = mesh_plugin.after_prompt_built(pctx)
+    assert result is not None
+    assert "# SYSTEM — MESH REPLY RULE" in result.prompt
+    assert "You MUST use the `mesh_send` tool" in result.prompt
+    assert "Do NOT put the mesh payload in your final assistant text" in result.prompt
+
+
+def test_mesh_prompt_after_prompt_built_adds_silence_cta(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    mesh_plugin._state["current_mesh"] = {
+        "sender": "hermes-0",
+        "body": "done",
+        "reply": "end",
+    }
+    pctx = PromptContext(
+        prompt="## Identity\n\n## User\ndone",
+        notice=None,
+        memory_flags={},
+        slots={},
+    )
+    result = mesh_plugin.after_prompt_built(pctx)
+    assert result is not None
+    assert "# SYSTEM — MESH SILENCE RULE" in result.prompt
+
+
+def test_mesh_send_tracker_floats_to_telegram(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tracker = MeshSendTracker(
+        chat_id="7945905361",
+        harness_url="http://127.0.0.1:4003",
+        state_path=tmp_path / "state.json",
+        api_key="secret",
+        max_sends=3,
+        max_message_in_turn_suggestion=2,
+    )
+    mock_client = MagicMock()
+    tracker._client = mock_client
+
+    tracker.notify_telegram(
+        sender="vesper",
+        recipient="aurelia",
+        body="pong",
+        action="info",
+        reply="end",
+        msg_id="msg-123",
+    )
+
+    mock_client.post.assert_called_once()
+    call_args = mock_client.post.call_args
+    assert call_args[0][0] == "/mesh/7945905361/notify"
+    assert call_args.kwargs["json"] == {
+        "sender": "vesper",
+        "recipient": "aurelia",
+        "body": "pong",
+        "action": "info",
+        "reply": "end",
+        "msg_id": "msg-123",
+    }
+    assert call_args.kwargs["headers"]["X-API-Key"] == "secret"

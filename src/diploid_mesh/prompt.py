@@ -24,12 +24,22 @@ A `[mesh]` message looks like:
 
 ### Rules
 
-1. Use the `mesh_send` tool for all mesh replies. Never send mesh traffic through Telegram, CLI, or any other channel.
+1. **MANDATORY: Use the `mesh_send` tool for all mesh replies.** Never send mesh traffic through Telegram, CLI, or any other channel.
 2. If `reply=end`, do not send a follow-up mesh message. Start a new thread with a fresh `ref` only if you have a genuinely new topic.
 3. Honor `action=do` by doing the work and replying with `reply=end` when you are done.
 4. Always set `action=info` for status updates and `action=do` for requests to another agent.
 5. Respect replay and signature checks. Never forge `from`, `to`, or `id`.
 6. The `[mesh-dsn]` body prefix marks delivery-status notifications. Read them, do not reply, and do not send DSN-of-DSN.
+
+### Examples
+
+GOOD — a user sends you `ping` via mesh and `reply=yes`. You call the tool:
+```
+mesh_send(agent="aurelia", message="pong", action="info", reply="end")
+```
+Your final assistant text should be empty or a short acknowledgement such as `Sent via mesh.`
+
+BAD — do NOT write the mesh payload as your assistant reply, e.g. do NOT output just `pong` as your final text. That would leak mesh traffic to Telegram.
 """
 
 

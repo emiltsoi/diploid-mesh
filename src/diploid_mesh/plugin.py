@@ -15,7 +15,7 @@ from diploid_agent.config import (
     MeshConfig as HarnessMeshConfig,
 )
 from diploid_agent.plugins.base import StatePlugin, TurnInfo, WakeContext
-from diploid_agent.plugins.contexts import PromptBuildContext
+from diploid_agent.plugins.contexts import PromptBuildContext, PromptContext
 
 from diploid_mesh.config import DiploidMeshConfig
 from diploid_mesh.prompt import mesh_prompt_block
@@ -141,6 +141,62 @@ class DiploidMeshPlugin(StatePlugin):
         if max_chars and len(block) > max_chars:
             block = block[:max_chars]
         return block
+
+    def after_prompt_built(self, pctx: PromptContext) -> PromptContext | None:
+        """Prepend an unambiguous, top-of-prompt CTA when a mesh reply is required."""
+        mesh = self._state.get("current_mesh")
+        if not isinstance(mesh, dict):
+            return None
+
+        reply = mesh.get("reply", "no")
+        if reply == "end":
+            # Terminal message: no reply needed, but still reinforce silence.
+            cta = self._mesh_silence_cta(mesh)
+        elif reply == "no":
+            # One-way message: the agent should do work locally and only reply
+            # in an exceptional case. We still remind it of the tool in case it
+            # decides to reply.
+            cta = self._mesh_tool_cta(mesh, optional=True)
+        else:
+            # reply == "yes" or any other value: a mesh reply is expected.
+            cta = self._mesh_tool_cta(mesh, optional=False)
+
+        if cta:
+            pctx.prompt = f"{cta}\n\n{pctx.prompt}"
+        return pctx
+
+    def _mesh_tool_cta(self, mesh: dict[str, Any], optional: bool) -> str | None:
+        sender = mesh.get("sender", "unknown")
+        body = (mesh.get("body") or "").strip()
+        lines = [
+            "# SYSTEM — MESH REPLY RULE",
+            f"You have an active mesh message from `{sender}`.",
+        ]
+        if body:
+            lines.append(f"Message body: {body}")
+        if optional:
+            lines.append(
+                "This is a one-way message. Do the work locally. "
+                "If you choose to reply, you MUST use the `mesh_send` tool; "
+                "do NOT put the reply in your final assistant text."
+            )
+        else:
+            lines.append(
+                "You MUST use the `mesh_send` tool for your reply. "
+                "Do NOT put the mesh payload in your final assistant text. "
+                "Your final assistant text should be empty or a short acknowledgement "
+                "(e.g. 'Sent via mesh.')."
+            )
+        lines.append("Close the thread with `reply=end` when you are done.")
+        return "\n".join(lines)
+
+    def _mesh_silence_cta(self, mesh: dict[str, Any]) -> str | None:
+        sender = mesh.get("sender", "unknown")
+        return (
+            f"# SYSTEM — MESH SILENCE RULE\n"
+            f"The mesh message from `{sender}` is terminal (`reply=end`). "
+            "Do NOT send a mesh reply and do not discuss its content in your assistant text."
+        )
 
     def on_waking(self, context: WakeContext) -> None:
         if context.wake_event is None:

@@ -8,7 +8,6 @@ from typing import Any
 
 from diploid_agent.transport.ingress import IngressHandler
 from fastapi import Request, Response
-from starlette.background import BackgroundTasks
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
@@ -84,45 +83,26 @@ class DiploidMeshIngress(IngressHandler):
             reason="mesh",
             priority=1,
             scheduled_at=time.time(),
-            payload={"user_message": display_text, "mesh": mesh_payload},
+            payload={
+                "user_message": display_text,
+                "mesh": mesh_payload,
+                # Surface mesh wakes as user-visible turns even if the waker
+                # has to retry the wake later (it falls back to payload.silent).
+                "silent": False,
+            },
             silent=False,
             ready=True,
         )
         self.runtime.wake_queue.enqueue(event)
 
-        # Process the wake in the background so the webhook can return 202
-        # immediately. A mesh delivery must not block on the full ACP turn.
-        background = BackgroundTasks()
-        background.add_task(self._process_wake, chat_id, event_id, envelope.msg_id)
-
+        # Return 202 immediately. The TimerService (or any waker subscribed to
+        # the event bus) will pop the due wake and run it on its own single
+        # thread. This keeps the HTTP response fast without dragging the ACP
+        # client into Starlette's worker-thread pool, which can race on the
+        # asyncio event loop.
         return JSONResponse(
             {"status": "accepted", "delivery_id": envelope.msg_id, "chat_id": chat_id},
             status_code=202,
-            background=background,
-        )
-
-    def _process_wake(self, chat_id: str, event_id: str, delivery_id: str) -> None:
-        """Run the mesh wake in the background; complete or fail the queue entry."""
-        try:
-            result = self.runtime.wake(chat_id, event_id=event_id)
-        except Exception:
-            logger.exception("[diploid-mesh] failed to wake chat %s", chat_id)
-            retry_after = self.runtime.config.harness.timer.retry_after_seconds
-            self.runtime.wake_queue.fail(event_id, retry_after=retry_after)
-            return
-
-        if result.reply == "Chat is busy; wake re-enqueued.":
-            # The wake remains in the queue and will be retried by the waker.
-            return
-
-        # Mark the wake as complete so the waker does not retry it.
-        self.runtime.wake_queue.complete(event_id)
-
-        logger.info(
-            "[diploid-mesh] wake %s for chat %s completed (delivery_id=%s)",
-            event_id,
-            chat_id,
-            delivery_id,
         )
 
     @staticmethod
