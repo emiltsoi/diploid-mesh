@@ -39,7 +39,8 @@ class MeshSendTracker:
         max_message_in_turn_suggestion: int,
     ) -> None:
         self.chat_id = chat_id
-        self.harness_url = harness_url.rstrip("/") if harness_url else ""
+        effective_url = harness_url or os.getenv("HARNESS_URL", "")
+        self.harness_url = effective_url.rstrip("/") if effective_url else ""
         self.state_path = state_path
         self.api_key = api_key
         self.max_sends = max(0, max_sends)
@@ -429,7 +430,11 @@ def main() -> None:
     parser.add_argument("--chat-id", required=True)
     parser.add_argument("--sessions-root", required=True)
     parser.add_argument("--state-file", default="chat_mesh_state.json")
-    parser.add_argument("--harness-url", default="")
+    parser.add_argument(
+        "--harness-url",
+        default=os.getenv("HARNESS_URL", ""),
+        help="URL of the diploid-agent harness. Defaults to HARNESS_URL env var.",
+    )
     args = parser.parse_args()
 
     mesh_config = _mesh_config_from_env()
