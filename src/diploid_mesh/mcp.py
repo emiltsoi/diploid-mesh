@@ -107,6 +107,21 @@ class MeshSendTracker:
             logger.exception("MeshSendTracker failed to query /turn/%s", self.chat_id)
         return None
 
+    def _infer_from_session(self) -> str | None:
+        """Return the current turn's mesh session, if one is recorded.
+
+        The state file is written by the DiploidMeshPlugin on wake and is the
+        source of truth for which session an inbound mesh message came in on.
+        """
+        if not self.state_path.exists():
+            return None
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            mesh = data.get("current_mesh") or {}
+            return mesh.get("session") or mesh.get("from_session")
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def _current_mesh_reply(self) -> str | None:
         """Read current_mesh.reply from the plugin state file, if present."""
         if not self.state_path.exists():
@@ -185,13 +200,24 @@ class DiploidMeshMcpServer:
     """Minimal stdio MCP server backed by DiploidMesh."""
 
     def __init__(self, config: DiploidMeshConfig, args: argparse.Namespace) -> None:
+        effective_harness = args.harness_url or os.getenv("HARNESS_URL", "")
+        config = DiploidMeshConfig(config.config, harness_url=effective_harness)
         self.mesh = DiploidMesh(config)
         self.chat_id = args.chat_id
+        if config.auto_join:
+            try:
+                result = self.mesh.join_mesh()
+                if not result.get("ok"):
+                    logger.warning("mesh auto_join returned: %s", result)
+                else:
+                    self._ensure_default_session_map()
+            except Exception:
+                logger.exception("mesh auto_join failed")
         state_dir = Path(args.sessions_root) / args.chat_id.replace("/", "_")
         state_path = state_dir / (args.state_file or "chat_mesh_state.json")
         self.tracker = MeshSendTracker(
             chat_id=args.chat_id,
-            harness_url=args.harness_url or os.getenv("HARNESS_URL", ""),
+            harness_url=effective_harness,
             state_path=state_path,
             api_key=os.getenv("HARNESS_API_KEY"),
             max_sends=int(os.getenv("MESH_MAX_SENDS_PER_TURN", "3")),
@@ -199,6 +225,60 @@ class DiploidMeshMcpServer:
                 os.getenv("MESH_MAX_MESSAGE_IN_TURN_SUGGESTION", "2")
             ),
         )
+
+    def _infer_reply_sessions(self) -> tuple[str | None, str | None]:
+        """Return (outbound_session, outbound_from_session) for a mesh reply.
+
+        If the active mesh message had `session`/`from_session` tokens, we swap
+        them for the reply: the reply is sent to the sender's `from_session`
+        and tagged with our own receiving `session`. If the inbound message did
+        not carry session tokens, we fall back to a reverse lookup of
+        `chat_map` so session-mode agents can still set `from_session`.
+        """
+        if not self.tracker.state_path.exists():
+            return None, None
+        try:
+            data = json.loads(self.tracker.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None, None
+        mesh = data.get("current_mesh") or {}
+        inbound_session = mesh.get("session") or mesh.get("from_session")
+        inbound_from_session = mesh.get("from_session") or mesh.get("session")
+        # If both are present and equal, prefer the real values.
+        if "session" in mesh and "from_session" in mesh:
+            inbound_session = mesh.get("session")
+            inbound_from_session = mesh.get("from_session")
+
+        session = inbound_from_session
+        from_session = inbound_session
+        if from_session is None:
+            chat_map = self.mesh.config.config.chat_map
+            for name, chat_id in chat_map.items():
+                if chat_id == self.chat_id:
+                    from_session = name
+                    break
+        return session, from_session
+
+    def _ensure_default_session_map(self) -> None:
+        """Map the default `chat` and `review` sessions to the operator chat on first join."""
+        if not self.chat_id:
+            return
+        try:
+            client = self.tracker._client_or_none()
+            if client:
+                client.post(
+                    "/mesh/chat-map",
+                    json={
+                        "chat_map": {
+                            "chat": self.chat_id,
+                            "review": self.chat_id,
+                        },
+                        "chat_mapping": "session",
+                    },
+                    headers={"X-API-Key": self.tracker.api_key or ""},
+                )
+        except Exception:
+            logger.warning("mesh_join: failed to set default session chat map", exc_info=True)
 
     def _tools(self) -> list[dict[str, Any]]:
         return [
@@ -209,22 +289,32 @@ class DiploidMeshMcpServer:
             },
             {
                 "name": "mesh_send",
-                "description": "Send a mesh message to another agent.",
+                "description": (
+                    "Send a mesh message to another agent. Optional session selects "
+                    "the receiver's named session; from_session tells the receiver "
+                    "where to reply."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "agent": {"type": "string"},
                         "message": {"type": "string"},
                         "action": {"type": "string", "enum": ["do", "info"], "default": "do"},
-                        "reply": {"type": "string", "enum": ["yes", "no", "end"], "default": "yes"},
+                        "reply": {
+                            "type": "string",
+                            "enum": ["yes", "no", "end"],
+                            "default": "yes",
+                        },
                         "ref": {"type": "string"},
+                        "session": {"type": "string"},
+                        "from_session": {"type": "string"},
                     },
                     "required": ["agent", "message"],
                 },
             },
             {
                 "name": "mesh_register",
-                "description": "Register an agent with the mesh-peer-registry.",
+                "description": "Register this agent in the local mesh vault and optionally the registry.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -232,9 +322,25 @@ class DiploidMeshMcpServer:
                         "url": {"type": "string"},
                         "role": {"type": "string", "default": "agent"},
                         "description": {"type": "string"},
-                        "ttl": {"type": "integer"},
+                        "publish": {"type": "boolean", "default": True},
                     },
-                    "required": ["name", "url"],
+                },
+            },
+            {
+                "name": "mesh_join",
+                "description": "Join the family mesh: write identity to the shared vault, publish to the registry, and sync peers.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "mesh_map_session",
+                "description": "Map a mesh session name to a Telegram chat id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session": {"type": "string"},
+                        "chat_id": {"type": "string"},
+                    },
+                    "required": ["session", "chat_id"],
                 },
             },
             {
@@ -322,12 +428,23 @@ class DiploidMeshMcpServer:
                     if not ok:
                         return _tool_result(req_id, f"Mesh send blocked: {hint}", is_error=True)
 
+                    session = arguments.get("session")
+                    from_session = arguments.get("from_session")
+                    if session is None or from_session is None:
+                        inferred_session, inferred_from_session = self._infer_reply_sessions()
+                        if session is None:
+                            session = inferred_session
+                        if from_session is None:
+                            from_session = inferred_from_session
+
                     result = self.mesh.send(
                         recipient=arguments["agent"],
                         body=arguments["message"],
                         action=arguments.get("action", "do"),
                         reply=arguments.get("reply", "yes"),
                         ref=arguments.get("ref"),
+                        session=session,
+                        from_session=from_session,
                     )
                     if result.error:
                         return _tool_result(
@@ -347,21 +464,53 @@ class DiploidMeshMcpServer:
                     return _tool_result(req_id, out)
 
                 if name == "mesh_register":
-                    result = self.mesh.register(
-                        name=arguments["name"],
-                        url=arguments["url"],
+                    url = arguments.get("url")
+                    local = self.mesh.register_local(
+                        name=arguments.get("name"),
+                        url=url,
                         role=arguments.get("role", "agent"),
                         description=arguments.get("description", ""),
-                        ttl=arguments.get("ttl"),
                     )
+                    if not local.get("ok"):
+                        return _tool_result(req_id, json.dumps(local), is_error=True)
+                    if arguments.get("publish", True):
+                        published = self.mesh.publish(
+                            name=local["name"],
+                            url=local["url"],
+                            role=arguments.get("role", "agent"),
+                            description=arguments.get("description", ""),
+                        )
+                        local["published"] = published
+                    return _tool_result(req_id, json.dumps(local, indent=2))
+
+                if name == "mesh_join":
+                    result = self.mesh.join_mesh()
+                    self._ensure_default_session_map()
                     return _tool_result(req_id, json.dumps(result, indent=2))
+
+                if name == "mesh_map_session":
+                    session = arguments["session"]
+                    chat_id = arguments["chat_id"]
+                    client = self.tracker._client_or_none()
+                    if client is None:
+                        return _tool_result(req_id, "No harness URL", is_error=True)
+                    resp = client.post(
+                        "/mesh/chat-map",
+                        json={"chat_map": {session: chat_id}},
+                        headers={"X-API-Key": self.tracker.api_key or ""},
+                    )
+                    if resp.status_code != 200:
+                        return _tool_result(
+                            req_id, f"Failed: {resp.status_code} {resp.text}", is_error=True
+                        )
+                    return _tool_result(req_id, json.dumps({"ok": True, "session": session, "chat_id": chat_id}))
 
                 if name == "mesh_deregister":
                     result = self.mesh.deregister(arguments["name"])
                     return _tool_result(req_id, json.dumps(result, indent=2))
 
                 if name == "mesh_sync":
-                    result = self.mesh.sync(arguments.get("name"))
+                    result = self.mesh.sync_to_vault(arguments.get("name"))
                     return _tool_result(req_id, json.dumps(result, indent=2))
 
                 if name == "mesh_publish":
@@ -405,7 +554,7 @@ class DiploidMeshMcpServer:
                 print(json.dumps(response), flush=True)
 
 
-def _mesh_config_from_env() -> DiploidMeshConfig:
+def _mesh_config_from_env(harness_url: str = "") -> DiploidMeshConfig:
     """Build a DiploidMeshConfig from environment overrides and defaults."""
     from diploid_agent.config import MeshConfig
 
@@ -422,7 +571,9 @@ def _mesh_config_from_env() -> DiploidMeshConfig:
         mesh.registry_url = os.getenv("MESH_REGISTRY_URL")
     if os.getenv("MESH_REGISTRY_PIN"):
         mesh.registry_pin = os.getenv("MESH_REGISTRY_PIN")
-    return DiploidMeshConfig(mesh)
+    if os.getenv("MESH_AUTO_JOIN"):
+        mesh.auto_join = os.getenv("MESH_AUTO_JOIN", "").lower() in ("1", "true", "yes")
+    return DiploidMeshConfig(mesh, harness_url=harness_url)
 
 
 def main() -> None:
@@ -437,7 +588,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    mesh_config = _mesh_config_from_env()
+    mesh_config = _mesh_config_from_env(args.harness_url)
     server = DiploidMeshMcpServer(mesh_config, args)
     server.run()
 

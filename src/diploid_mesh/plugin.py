@@ -124,6 +124,10 @@ class DiploidMeshPlugin(StatePlugin):
                 f"- action: `{mesh.get('action', 'info')}`",
                 f"- reply expected: `{reply}`",
             ]
+            if mesh.get("session"):
+                lines.append(f"- session: `{mesh['session']}`")
+            if mesh.get("from_session"):
+                lines.append(f"- from_session: `{mesh['from_session']}`")
             if mesh.get("ref"):
                 lines.append(f"- ref: `{mesh['ref']}`")
             if reply == "no":

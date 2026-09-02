@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 from mesh_core import (
     DeliveryClient,
@@ -71,15 +74,29 @@ class DiploidMesh:
                 return True
         return False
 
-    def resolve_chat_id(self, sender: str) -> str:
-        """Map an inbound sender to a diploid chat_id."""
-        cfg = self.core_config
+    def resolve_chat_id(self, sender: str, session: str | None = None) -> str:
+        """Map an inbound sender/session to a diploid chat_id.
+
+        - chat_mapping == "single" -> always fallback_chat_id.
+        - chat_mapping == "per_sender" -> chat_map keyed by sender, then
+          known peer default, then fallback_chat_id.
+        - chat_mapping == "session" -> chat_map keyed by session name,
+          falling back to sender lookup, then known peer default, then
+          fallback_chat_id.
+        """
+        cfg = self.config.config
         if cfg.chat_mapping == "single":
             return cfg.fallback_chat_id
+
+        if cfg.chat_mapping == "session" and session and session in cfg.chat_map:
+            return cfg.chat_map[session]
+
         if sender in cfg.chat_map:
             return cfg.chat_map[sender]
+
         if self.is_known(sender):
             return f"mesh:{sender}"
+
         return cfg.fallback_chat_id
 
     def _resolve_target(self, recipient: str) -> tuple[str | None, bool]:
@@ -178,6 +195,8 @@ class DiploidMesh:
         reply: str = "yes",
         ref: str | None = None,
         msg_id: str | None = None,
+        session: str | None = None,
+        from_session: str | None = None,
     ) -> DeliveryResult:
         """Send a mesh message to `recipient`."""
         import uuid
@@ -191,6 +210,8 @@ class DiploidMesh:
             action=action,  # type: ignore[arg-type]
             reply=reply,  # type: ignore[arg-type]
             ref=ref,
+            session=session,
+            from_session=from_session,
             body=body,
         )
         target_url, allow_loopback = self._resolve_target(recipient)
@@ -214,7 +235,7 @@ class DiploidMesh:
     def register(
         self,
         name: str,
-        url: str,
+        url: str | None = None,
         role: str = "agent",
         description: str = "",
         ttl: int | None = None,
@@ -222,6 +243,10 @@ class DiploidMesh:
         """Register this or another peer with the mesh-peer-registry."""
         if not self.registry:
             return {"ok": False, "error": "registry_url not configured"}
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
         return self.registry.register(name, url, role, description, ttl)
 
     def deregister(self, name: str) -> dict:
@@ -230,12 +255,7 @@ class DiploidMesh:
         return self.registry.deregister(name)
 
     def sync(self, name: str | None = None) -> dict:
-        if not self.registry:
-            return {"ok": False, "error": "registry_url not configured"}
-        if name:
-            peer = self.registry.get_peer(name)
-            return {"ok": True, "peer": peer}
-        return {"ok": True, "peers": self.registry.list_peers()}
+        return self.sync_to_vault(name)
 
     def publish(
         self,
@@ -247,6 +267,173 @@ class DiploidMesh:
     ) -> dict:
         """Publish this agent's own identity to the registry."""
         name = name or self.core_config.agent_name
-        if not url:
-            url = f"http://{self.core_config.agent_name}:4003/mesh/receive"
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
         return self.register(name, url, role, description, ttl)
+
+    def _default_receive_url(self) -> str:
+        """Return this agent's canonical mesh receive URL.
+
+        Priority:
+        1. The configured harness_url + /mesh/receive.
+        2. The URL stored in this agent's own vault identity.
+
+        If neither is available, fail loudly. Never fall back to a guessed
+        hostname/port, because publishing a bad URL to the registry will break
+        peer discovery.
+        """
+        if self.config.harness_url:
+            return f"{self.config.harness_url.rstrip('/')}/mesh/receive"
+        own = self.vault.get(self.core_config.agent_name)
+        if own and own.url:
+            return own.url
+        raise RuntimeError(
+            "Cannot determine mesh receive URL: set harness_url or register "
+            "an identity with a URL before publishing."
+        )
+
+    def _harness_port_from_url(self, url: str) -> int:
+        parsed = urlparse(url)
+        return parsed.port or 80
+
+    def register_local(
+        self,
+        name: str | None = None,
+        url: str | None = None,
+        role: str = "agent",
+        description: str = "",
+        platform: str = "diploid",
+    ) -> dict:
+        """Write this agent's identity to the local mesh vault."""
+        name = name or self.core_config.agent_name
+        if not name:
+            return {"ok": False, "error": "agent name not configured"}
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not url:
+            return {"ok": False, "error": "receive URL not configured"}
+
+        identity = MeshIdentity(
+            id=name,
+            name=name,
+            role=role,
+            description=description or f"Diploid agent substrate — {name.title()}",
+            url=url,
+            a2a_url="",
+            public_key=self.public_key,
+            allow_loopback=self.core_config.allow_loopback,
+            platform=platform,
+        )
+        path = self.vault.save(name, identity)
+
+        # Re-read and add diploid-specific markers that mesh_core ignores but
+        # other tooling can use.
+        raw = self.vault._load_yaml(path) or {}
+        raw["kind"] = "diploid-agent"
+        raw["platform"] = platform
+        raw.setdefault("mesh", {})
+        raw["mesh"]["port"] = self._harness_port_from_url(url)
+        raw["mesh"]["registry_url"] = self.core_config.registry_url or ""
+        raw["mesh"]["allow_loopback"] = self.core_config.allow_loopback
+        self.vault._save_yaml(path, raw)
+
+        return {"ok": True, "name": name, "path": str(path), "url": url}
+
+    def join_mesh(self) -> dict:
+        """Join the family mesh: local identity, publish, sync peers."""
+        local = self.register_local()
+        if not local.get("ok"):
+            return local
+        published = self.publish(
+            role=local.get("role", "agent"),
+            description=local.get("description", ""),
+        )
+        synced = self.sync_to_vault()
+        return {
+            "ok": True,
+            "registered": local,
+            "published": published,
+            "synced": synced,
+        }
+
+    def sync_to_vault(self, name: str | None = None) -> dict:
+        """Fetch peer(s) from the registry and persist them in the local vault.
+
+        Existing identity files are updated in place only for the standard
+        mesh_core fields (url, public_key, role, description). Extra keys such
+        as `kind` or `platforms` are preserved.
+        """
+        if not self.registry:
+            return {"ok": False, "error": "registry_url not configured"}
+
+        peers: list[Any]
+        if name:
+            peer = self.registry.get_peer(name)
+            peers = [peer] if peer else []
+        else:
+            peers = self.registry.list_peers()
+
+        saved: list[str] = []
+        updated: list[str] = []
+        failed: list[dict] = []
+        for peer in peers:
+            try:
+                identity = MeshIdentity(
+                    id=peer.name,
+                    name=peer.name,
+                    role=peer.role or "agent",
+                    description=peer.description or "",
+                    url=peer.url,
+                    a2a_url="",
+                    public_key=peer.public_key,
+                    allow_loopback=bool(getattr(peer, "allow_loopback", False)),
+                    platform=self._infer_peer_platform(peer),
+                )
+                path = self.vault._identity_file(peer.name)
+                if path.exists():
+                    self._merge_identity(path, identity)
+                    updated.append(peer.name)
+                else:
+                    self.vault.save(peer.name, identity)
+                    saved.append(peer.name)
+            except Exception as exc:
+                failed.append({"name": peer.name, "error": str(exc)})
+
+        return {
+            "ok": True,
+            "saved": saved,
+            "updated": updated,
+            "failed": failed,
+            "total": len(peers),
+        }
+
+    def _merge_identity(self, path: Path, identity: MeshIdentity) -> None:
+        """Update an existing identity.yaml while preserving extra keys."""
+        raw = self.vault._load_yaml(path) or {}
+        raw["id"] = identity.id or identity.name
+        raw["name"] = identity.name
+        raw["role"] = identity.role
+        raw["description"] = identity.description
+        if identity.allow_loopback:
+            raw["allow_loopback"] = True
+        if identity.platform:
+            raw["platform"] = identity.platform
+        transports = raw.setdefault("transports", {})
+        hermes = transports.setdefault("hermes_webhook", {})
+        hermes["url"] = identity.url
+        hermes["auth"] = {"public_key": identity.public_key}
+        self.vault._save_yaml(path, raw)
+        self.vault._cache.pop(path, None)
+
+    def _infer_peer_platform(self, peer: Any) -> str:
+        """Guess the peer's substrate from its metadata or URL."""
+        if getattr(peer, "platform", None):
+            return peer.platform
+        url = (getattr(peer, "url", "") or "").lower()
+        if "/plugins/openclaw-mesh" in url or "openclaw" in url:
+            return "openclaw"
+        return "hermes"

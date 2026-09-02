@@ -38,7 +38,7 @@ class DiploidMeshIngress(IngressHandler):
             logger.exception("[diploid-mesh] error verifying inbound")
             return JSONResponse({"status": "error", "reason": "internal error"}, status_code=500)
 
-        chat_id = self.mesh.resolve_chat_id(envelope.sender)
+        chat_id = self.mesh.resolve_chat_id(envelope.sender, envelope.session)
         display_text = self._display_text(envelope)
 
         is_dsn = (envelope.body or "").startswith("[mesh-dsn]") or self._is_dsn_header(headers)
@@ -50,6 +50,8 @@ class DiploidMeshIngress(IngressHandler):
             "reply": envelope.reply,
             "ref": envelope.ref,
             "message_id": envelope.msg_id,
+            "session": envelope.session,
+            "from_session": envelope.from_session,
         }
 
         # DSNs are terminal: record without a model turn.

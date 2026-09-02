@@ -9,10 +9,16 @@ from mesh_core import MeshConfig as CoreMeshConfig
 class DiploidMeshConfig:
     """Convenience wrapper that builds a mesh_core config from diploid-agent config."""
 
-    def __init__(self, config: HarnessMeshConfig) -> None:
+    def __init__(self, config: HarnessMeshConfig, harness_url: str = "") -> None:
         self.config = config
+        self.harness_url = harness_url
 
     def to_mesh_core(self) -> CoreMeshConfig:
+        """Build a mesh_core config from the diploid harness config.
+
+        chat_mapping/fallback_chat_id/chat_map are diploid routing concepts and
+        live on the HarnessMeshConfig; they are not passed to mesh_core.
+        """
         return CoreMeshConfig(
             agent_name=self.config.agent_name or "diploid-0",
             private_key_path=self.config.private_key_path,
@@ -22,9 +28,6 @@ class DiploidMeshConfig:
             allow_insecure_registry=self.config.allow_insecure_registry,
             sign_timestamp=self.config.sign_timestamp,
             allow_loopback=self.config.allow_loopback,
-            chat_mapping=self.config.chat_mapping,
-            fallback_chat_id=self.config.fallback_chat_id,
-            chat_map=self.config.chat_map,
             delivery_retries=self.config.delivery_retries,
             delivery_backoff=self.config.delivery_backoff,
             delivery_timeout=self.config.delivery_timeout,
@@ -49,3 +52,7 @@ class DiploidMeshConfig:
     @property
     def max_message_in_turn_suggestion(self) -> int:
         return self.config.max_message_in_turn_suggestion
+
+    @property
+    def auto_join(self) -> bool:
+        return getattr(self.config, "auto_join", False)
