@@ -41,6 +41,25 @@ pip install -e /path/to/diploid-mesh
 - `reply=end`: the recipient runs an ACP turn but the MCP server hard-blocks all `mesh_send` calls; this is the last message in the thread.
 - DSNs (`[mesh-dsn]` body prefix): delivery-status notifications are recorded, not replied to, and do not start a turn.
 
+## Chat routing
+
+Inbound mesh messages are mapped to a diploid `chat_id` using `harness.mesh.chat_mapping` and `harness.mesh.chat_map`:
+
+- `chat_mapping: session` — the `session` envelope token is looked up in
+  `chat_map`. If it matches a key, the message goes to that chat. If it does
+  not match, the sender is looked up in `chat_map`. If that does not match,
+  the message falls back to `fallback_chat_id`.
+- `chat_mapping: per_sender` — the sender name is looked up in `chat_map` and
+  falls back to `fallback_chat_id`.
+- `chat_mapping: single` — every message goes to `fallback_chat_id`.
+
+When `fallback_chat_id` is a real Telegram numeric chat id, unmapped known
+peers are routed to that Telegram chat. Only when the fallback is not a
+Telegram chat (e.g. `mesh:inbox`) does a known but unmapped peer get its own
+`mesh:<sender>` session. This keeps messages from Hermes, OpenClaw, and other
+agents from landing in phantom sessions on diploid-agent instances that are
+backed by Telegram.
+
 ## Per-turn send cap
 
 `harness.mesh.max_sends_per_turn` hard-limits how many `mesh_send` calls the agent can make within a single active ACP turn. The default is `3`.
