@@ -11,6 +11,7 @@ Flow (per Devin's docs/hermes-interop.md):
 
 Marked @pytest.mark.fleet (fleet interop suite).
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,9 @@ import pytest
 logger = logging.getLogger(__name__)
 
 # ── hermes-mesh on the stub gateway ─────────────────────────────────────
-_HERMES_MESH = Path(os.environ.get("HERMES_MESH_PATH", Path.home() / "CascadeProjects" / "hermes-mesh"))
+_HERMES_MESH = Path(
+    os.environ.get("HERMES_MESH_PATH", Path.home() / "CascadeProjects" / "hermes-mesh")
+)
 _STUBS = _HERMES_MESH / "tests" / "stubs"
 if _HERMES_MESH.exists():
     if str(_STUBS) not in sys.path:
@@ -107,15 +110,21 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
         vault.save(
             name,
             MeshIdentity(
-                id=name, name=name, role="agent", description="test peer",
-                url=url, public_key=public_key,
+                id=name,
+                name=name,
+                role="agent",
+                description="test peer",
+                url=url,
+                public_key=public_key,
             ),
         )
 
     _write_identity(receiver_vault, receiver_name, receiver_public)
     _write_identity(receiver_vault, sender_name, sender_public)
     _write_identity(
-        sender_vault, receiver_name, receiver_public,
+        sender_vault,
+        receiver_name,
+        receiver_public,
         url=f"http://127.0.0.1:{receiver_port}/mesh/receive",
     )
     _write_identity(sender_vault, sender_name, sender_public)
@@ -150,10 +159,12 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
     )
 
     runtime = AgentRuntime(cfg)
+
     # Devin's working pattern: assign a FakeEngine so no real model is needed
     class FakeEngine:
         def prompt(self, *a, **k):
             from diploid_agent.engine import TurnResult
+
             return TurnResult(reply="ok", session_id="s1")
 
         def list_models(self):
@@ -187,12 +198,15 @@ def test_hermes_mesh_to_diploid_agent(tmp_path: Path) -> None:
         import urllib.request as _urlreq
 
         body_json = _json.dumps(
-            {"text": "[mesh][v:1][from:hermes-0][to:diploid-0][id:interop-001]"
-                     "[action:do][reply:yes] hello from hermes-mesh (interop)",
-             "from": sender_name}
+            {
+                "text": "[mesh][v:1][from:hermes-0][to:diploid-0][id:interop-001]"
+                "[action:do][reply:yes] hello from hermes-mesh (interop)",
+                "from": sender_name,
+            }
         )
         timestamp = str(int(time.time()))
         from mesh_core.crypto import sign_message
+
         signature = sign_message(sender_private, f"{timestamp}\n{body_json}")
 
         req = _urlreq.Request(

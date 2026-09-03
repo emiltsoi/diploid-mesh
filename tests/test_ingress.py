@@ -250,9 +250,7 @@ def _make_mesh_plugin(runtime: AgentRuntime, chat_id: str) -> DiploidMeshPlugin:
         state_file="chat_mesh_state.json",
         enabled=True,
     )
-    return DiploidMeshPlugin(
-        config, chat_id, runtime.sessions_root, runtime=runtime
-    )
+    return DiploidMeshPlugin(config, chat_id, runtime.sessions_root, runtime=runtime)
 
 
 def test_mesh_prompt_after_prompt_built_adds_reply_cta(
@@ -301,9 +299,7 @@ def test_mesh_prompt_after_prompt_built_adds_silence_cta(
     assert "# SYSTEM — MESH SILENCE RULE" in result.prompt
 
 
-def test_mesh_send_tracker_floats_to_telegram(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_mesh_send_tracker_floats_to_telegram(tmp_path: Path, monkeypatch) -> None:
     tracker = MeshSendTracker(
         chat_id="7945905361",
         harness_url="http://127.0.0.1:4003",

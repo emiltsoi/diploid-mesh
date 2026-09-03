@@ -226,9 +226,7 @@ class DiploidMeshMcpServer:
             ),
         )
 
-    def _infer_reply_sessions(
-        self, recipient: str | None = None
-    ) -> tuple[str | None, str | None]:
+    def _infer_reply_sessions(self, recipient: str | None = None) -> tuple[str | None, str | None]:
         """Return (outbound_session, outbound_from_session) for a mesh message.
 
         - If we are replying to an active mesh message, swap its session tokens
@@ -515,7 +513,9 @@ class DiploidMeshMcpServer:
                         return _tool_result(
                             req_id, f"Failed: {resp.status_code} {resp.text}", is_error=True
                         )
-                    return _tool_result(req_id, json.dumps({"ok": True, "session": session, "chat_id": chat_id}))
+                    return _tool_result(
+                        req_id, json.dumps({"ok": True, "session": session, "chat_id": chat_id})
+                    )
 
                 if name == "mesh_deregister":
                     result = self.mesh.deregister(arguments["name"])
@@ -584,9 +584,7 @@ def _mesh_config_from_env(harness_url: str = "") -> DiploidMeshConfig:
     if os.getenv("MESH_REGISTRY_PIN"):
         mesh.registry_pin = os.getenv("MESH_REGISTRY_PIN")
     if os.getenv("MESH_ALLOW_LOOPBACK"):
-        mesh.allow_loopback = (
-            os.getenv("MESH_ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
-        )
+        mesh.allow_loopback = os.getenv("MESH_ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
     if os.getenv("MESH_CHAT_MAPPING"):
         mesh.chat_mapping = os.getenv("MESH_CHAT_MAPPING")
     if os.getenv("MESH_FALLBACK_CHAT_ID"):

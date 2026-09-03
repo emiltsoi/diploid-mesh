@@ -143,9 +143,7 @@ class DiploidMeshPlugin(StatePlugin):
                     "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."
                 )
             if reply == "end":
-                lines.append(
-                    "- **The sender has ended this thread. Do NOT send a mesh reply.**"
-                )
+                lines.append("- **The sender has ended this thread. Do NOT send a mesh reply.**")
             body = mesh.get("body") or ""
             if body:
                 lines.append(f"\nMessage body: {body}")

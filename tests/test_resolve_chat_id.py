@@ -14,7 +14,9 @@ def tmp_vault_path(tmp_path: Path) -> Path:
     return tmp_path / "vault"
 
 
-def _mesh(chat_mapping: str, fallback: str, chat_map: dict[str, str], tmp_path: Path) -> DiploidMesh:
+def _mesh(
+    chat_mapping: str, fallback: str, chat_map: dict[str, str], tmp_path: Path
+) -> DiploidMesh:
     cfg = MeshConfig(
         enabled=True,
         agent_name="diploid-0",
