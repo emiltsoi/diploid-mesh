@@ -27,6 +27,13 @@ from mesh_core.threads import record as record_thread_close
 from diploid_mesh.config import DiploidMeshConfig
 
 
+def _is_telegram_chat_id(chat_id: str | None) -> bool:
+    """Return True if chat_id looks like a Telegram numeric chat id."""
+    if not chat_id:
+        return False
+    return chat_id.lstrip("-").isdigit()
+
+
 class DiploidMesh:
     """Runtime handle for a diploid-agent mesh peer."""
 
@@ -80,10 +87,15 @@ class DiploidMesh:
 
         - chat_mapping == "single" -> always fallback_chat_id.
         - chat_mapping == "per_sender" -> chat_map keyed by sender, then
-          known peer default, then fallback_chat_id.
+          fallback_chat_id (or a mesh:<sender> chat if the fallback is not a
+          real Telegram chat id).
         - chat_mapping == "session" -> chat_map keyed by session name,
-          falling back to sender lookup, then known peer default, then
-          fallback_chat_id.
+          falling back to sender lookup, then fallback_chat_id (or a
+          mesh:<sender> chat if the fallback is not a real Telegram chat id).
+
+        When the fallback_chat_id is a real Telegram chat id, unmapped messages
+        from known peers are routed there instead of creating phantom
+        ``mesh:<sender>`` sessions.
         """
         cfg = self.config.config
         if cfg.chat_mapping == "single":
@@ -94,6 +106,12 @@ class DiploidMesh:
 
         if sender in cfg.chat_map:
             return cfg.chat_map[sender]
+
+        # Default unmapped known peers to the configured fallback chat when it
+        # is a real Telegram session. This prevents every new mesh peer from
+        # spawning a phantom `mesh:<sender>` chat on diploid-agent instances.
+        if _is_telegram_chat_id(cfg.fallback_chat_id):
+            return cfg.fallback_chat_id
 
         if self.is_known(sender):
             return f"mesh:{sender}"
