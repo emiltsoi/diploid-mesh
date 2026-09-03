@@ -218,6 +218,13 @@ class DiploidMeshPlugin(StatePlugin):
             mesh = payload.get("mesh", {})
             mesh["_arrived_at"] = time.time()
             self._state["current_mesh"] = mesh
+            # Keep a durable thread record keyed by sender so a reply can be
+            # sent from a later ACP turn after the transient current_mesh is
+            # cleared.
+            threads = self._state.setdefault("mesh_threads", {})
+            sender = mesh.get("sender")
+            if sender:
+                threads[sender] = mesh
             self._save_state()
 
     def before_build_prompt(self, context: PromptBuildContext) -> PromptBuildContext | None:
@@ -225,6 +232,10 @@ class DiploidMeshPlugin(StatePlugin):
         return None
 
     def after_turn(self, turn: TurnInfo) -> None:
-        """Clear transient mesh context once the turn is done."""
+        """Clear transient mesh context once the turn is done.
+
+        The durable `mesh_threads` map is preserved so multi-turn replies still
+        know which session the original message arrived on.
+        """
         self._state.pop("current_mesh", None)
         self._save_state()

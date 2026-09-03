@@ -226,38 +226,48 @@ class DiploidMeshMcpServer:
             ),
         )
 
-    def _infer_reply_sessions(self) -> tuple[str | None, str | None]:
-        """Return (outbound_session, outbound_from_session) for a mesh reply.
+    def _infer_reply_sessions(
+        self, recipient: str | None = None
+    ) -> tuple[str | None, str | None]:
+        """Return (outbound_session, outbound_from_session) for a mesh message.
 
-        If the active mesh message had `session`/`from_session` tokens, we swap
-        them for the reply: the reply is sent to the sender's `from_session`
-        and tagged with our own receiving `session`. If the inbound message did
-        not carry session tokens, we fall back to a reverse lookup of
-        `chat_map` so session-mode agents can still set `from_session`.
+        - If we are replying to an active mesh message, swap its session tokens
+          so the reply goes back on the same door. If the inbound message only
+          carried one token, use it for both directions to keep routing symmetric.
+        - Otherwise this is the first message in a thread: use the session name
+          that the current chat maps to for both `session` and `from_session`.
         """
-        if not self.tracker.state_path.exists():
-            return None, None
-        try:
-            data = json.loads(self.tracker.state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None, None
-        mesh = data.get("current_mesh") or {}
-        inbound_session = mesh.get("session") or mesh.get("from_session")
-        inbound_from_session = mesh.get("from_session") or mesh.get("session")
-        # If both are present and equal, prefer the real values.
-        if "session" in mesh and "from_session" in mesh:
-            inbound_session = mesh.get("session")
-            inbound_from_session = mesh.get("from_session")
+        state: dict[str, Any] = {}
+        if self.tracker.state_path.exists():
+            try:
+                state = json.loads(self.tracker.state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
 
-        session = inbound_from_session
-        from_session = inbound_session
-        if from_session is None:
-            chat_map = self.mesh.config.config.chat_map
-            for name, chat_id in chat_map.items():
-                if chat_id == self.chat_id:
-                    from_session = name
-                    break
-        return session, from_session
+        # Prefer the active turn's mesh context, fall back to a durable thread
+        # record for the recipient so multi-turn replies still work.
+        mesh = state.get("current_mesh") or {}
+        if not mesh and recipient:
+            mesh = (state.get("mesh_threads") or {}).get(recipient) or {}
+
+        inbound_session = mesh.get("session")
+        inbound_from_session = mesh.get("from_session")
+
+        if inbound_session or inbound_from_session:
+            # Use whichever token is present as the effective session for both
+            # sides, then swap: the reply is addressed to the sender's session
+            # and tagged with our receiving session.
+            effective = inbound_session or inbound_from_session
+            session = inbound_from_session or effective
+            from_session = inbound_session or effective
+            return session, from_session
+
+        # First message in a thread: route to the session this chat is mapped to.
+        chat_map = self.mesh.config.config.chat_map
+        for name, chat_id in chat_map.items():
+            if chat_id == self.chat_id:
+                return name, name
+        return None, None
 
     def _ensure_default_session_map(self) -> None:
         """Map the default `chat` and `review` sessions to the operator chat on first join."""
@@ -431,7 +441,9 @@ class DiploidMeshMcpServer:
                     session = arguments.get("session")
                     from_session = arguments.get("from_session")
                     if session is None or from_session is None:
-                        inferred_session, inferred_from_session = self._infer_reply_sessions()
+                        inferred_session, inferred_from_session = self._infer_reply_sessions(
+                            arguments.get("agent")
+                        )
                         if session is None:
                             session = inferred_session
                         if from_session is None:
