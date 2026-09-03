@@ -571,6 +571,19 @@ def _mesh_config_from_env(harness_url: str = "") -> DiploidMeshConfig:
         mesh.registry_url = os.getenv("MESH_REGISTRY_URL")
     if os.getenv("MESH_REGISTRY_PIN"):
         mesh.registry_pin = os.getenv("MESH_REGISTRY_PIN")
+    if os.getenv("MESH_ALLOW_LOOPBACK"):
+        mesh.allow_loopback = (
+            os.getenv("MESH_ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
+        )
+    if os.getenv("MESH_CHAT_MAPPING"):
+        mesh.chat_mapping = os.getenv("MESH_CHAT_MAPPING")
+    if os.getenv("MESH_FALLBACK_CHAT_ID"):
+        mesh.fallback_chat_id = os.getenv("MESH_FALLBACK_CHAT_ID")
+    if os.getenv("MESH_CHAT_MAP"):
+        try:
+            mesh.chat_map = json.loads(os.getenv("MESH_CHAT_MAP"))
+        except json.JSONDecodeError:
+            pass
     if os.getenv("MESH_AUTO_JOIN"):
         mesh.auto_join = os.getenv("MESH_AUTO_JOIN", "").lower() in ("1", "true", "yes")
     return DiploidMeshConfig(mesh, harness_url=harness_url)

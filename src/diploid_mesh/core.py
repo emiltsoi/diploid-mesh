@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -428,6 +429,7 @@ class DiploidMesh:
         keys and platform are left untouched.
         """
         raw = self.vault._load_yaml(path) or {}
+        original = copy.deepcopy(raw)
         raw["id"] = identity.id or identity.name
         raw["name"] = identity.name
         raw["role"] = identity.role
@@ -442,7 +444,8 @@ class DiploidMesh:
         existing_auth = hermes.get("auth", {}) or {}
         if not existing_auth.get("public_key") and identity.public_key:
             hermes["auth"] = {"public_key": identity.public_key}
-        self.vault._save_yaml(path, raw)
+        if raw != original:
+            self.vault._save_yaml(path, raw)
         self.vault._cache.pop(path, None)
 
     def _infer_peer_platform(self, peer: Any) -> str:

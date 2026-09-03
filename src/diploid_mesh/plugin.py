@@ -87,6 +87,14 @@ class DiploidMeshPlugin(StatePlugin):
             env.append(f"MESH_REGISTRY_URL={mesh.registry_url}")
         if mesh.private_key_path:
             env.append(f"MESH_PRIVATE_KEY_PATH={mesh.private_key_path}")
+        if mesh.allow_loopback:
+            env.append("MESH_ALLOW_LOOPBACK=1")
+        if mesh.chat_mapping:
+            env.append(f"MESH_CHAT_MAPPING={mesh.chat_mapping}")
+        if mesh.fallback_chat_id:
+            env.append(f"MESH_FALLBACK_CHAT_ID={mesh.fallback_chat_id}")
+        if mesh.chat_map:
+            env.append(f"MESH_CHAT_MAP={json.dumps(mesh.chat_map)}")
         if mesh.max_sends_per_turn is not None:
             env.append(f"MESH_MAX_SENDS_PER_TURN={mesh.max_sends_per_turn}")
         if mesh.max_message_in_turn_suggestion is not None:
