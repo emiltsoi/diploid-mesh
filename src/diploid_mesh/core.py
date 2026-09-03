@@ -341,7 +341,13 @@ class DiploidMesh:
         raw["mesh"]["allow_loopback"] = self.core_config.allow_loopback
         self.vault._save_yaml(path, raw)
 
-        return {"ok": True, "name": name, "path": str(path), "url": url}
+        return {
+            "ok": True,
+            "name": name,
+            "path": str(path),
+            "url": url,
+            "description": identity.description,
+        }
 
     def join_mesh(self) -> dict:
         """Join the family mesh: local identity, publish, sync peers."""
@@ -363,9 +369,11 @@ class DiploidMesh:
     def sync_to_vault(self, name: str | None = None) -> dict:
         """Fetch peer(s) from the registry and persist them in the local vault.
 
-        Existing identity files are updated in place only for the standard
-        mesh_core fields (url, public_key, role, description). Extra keys such
-        as `kind` or `platforms` are preserved.
+        New peers are saved with the registry's public_key and inferred platform.
+        Existing identity files are only updated for discovery fields
+        (url, role, description). Their public_key and platform are preserved,
+        because the local fleet vault is the canonical source of truth for keys
+        and substrate tags; the registry is only authoritative for discovery.
         """
         if not self.registry:
             return {"ok": False, "error": "registry_url not configured"}
@@ -400,7 +408,7 @@ class DiploidMesh:
                 else:
                     self.vault.save(peer.name, identity)
                     saved.append(peer.name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failed.append({"name": peer.name, "error": str(exc)})
 
         return {
@@ -412,7 +420,13 @@ class DiploidMesh:
         }
 
     def _merge_identity(self, path: Path, identity: MeshIdentity) -> None:
-        """Update an existing identity.yaml while preserving extra keys."""
+        """Update an existing identity.yaml while preserving public_key and platform.
+
+        The local fleet vault is the canonical source of truth for an agent's
+        public key and its substrate tag. The registry is only authoritative for
+        discovery metadata (url, role, description), so those are updated but
+        keys and platform are left untouched.
+        """
         raw = self.vault._load_yaml(path) or {}
         raw["id"] = identity.id or identity.name
         raw["name"] = identity.name
@@ -420,12 +434,14 @@ class DiploidMesh:
         raw["description"] = identity.description
         if identity.allow_loopback:
             raw["allow_loopback"] = True
-        if identity.platform:
+        if not raw.get("platform") and identity.platform:
             raw["platform"] = identity.platform
         transports = raw.setdefault("transports", {})
         hermes = transports.setdefault("hermes_webhook", {})
         hermes["url"] = identity.url
-        hermes["auth"] = {"public_key": identity.public_key}
+        existing_auth = hermes.get("auth", {}) or {}
+        if not existing_auth.get("public_key") and identity.public_key:
+            hermes["auth"] = {"public_key": identity.public_key}
         self.vault._save_yaml(path, raw)
         self.vault._cache.pop(path, None)
 
