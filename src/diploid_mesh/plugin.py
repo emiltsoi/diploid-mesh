@@ -118,35 +118,45 @@ class DiploidMeshPlugin(StatePlugin):
             env=env,
         )
 
-    def prompt_block(self, max_chars: int | None = None) -> str | None:
+    def prompt_block(self, max_chars: int | None = None, compact: bool = False) -> str | None:
         mesh = self._state.get("current_mesh")
         if not isinstance(mesh, dict):
             # Still provide the contract block so the agent knows how to mesh.
-            block = mesh_prompt_block()
+            block = mesh_prompt_block(compact=compact)
         else:
             reply = mesh.get("reply", "no")
-            lines = [
-                mesh_prompt_block(),
-                "",
-                f"## Active mesh message from `{mesh.get('sender', 'unknown')}`",
-                f"- action: `{mesh.get('action', 'info')}`",
-                f"- reply expected: `{reply}`",
-            ]
-            if mesh.get("session"):
-                lines.append(f"- session: `{mesh['session']}`")
-            if mesh.get("from_session"):
-                lines.append(f"- from_session: `{mesh['from_session']}`")
-            if mesh.get("ref"):
-                lines.append(f"- ref: `{mesh['ref']}`")
-            if reply == "no":
-                lines.append(
-                    "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."
-                )
-            if reply == "end":
-                lines.append("- **The sender has ended this thread. Do NOT send a mesh reply.**")
-            body = mesh.get("body") or ""
-            if body:
-                lines.append(f"\nMessage body: {body}")
+            if compact:
+                lines = [
+                    mesh_prompt_block(compact=True),
+                    "",
+                    f"## Active mesh message from `{mesh.get('sender', 'unknown')}` (action: {mesh.get('action', 'info')}, reply: {reply}).",
+                ]
+                body = mesh.get("body") or ""
+                if body:
+                    lines.append(f"Body: {body[:120]}")
+            else:
+                lines = [
+                    mesh_prompt_block(),
+                    "",
+                    f"## Active mesh message from `{mesh.get('sender', 'unknown')}`",
+                    f"- action: `{mesh.get('action', 'info')}`",
+                    f"- reply expected: `{reply}`",
+                ]
+                if mesh.get("session"):
+                    lines.append(f"- session: `{mesh['session']}`")
+                if mesh.get("from_session"):
+                    lines.append(f"- from_session: `{mesh['from_session']}`")
+                if mesh.get("ref"):
+                    lines.append(f"- ref: `{mesh['ref']}`")
+                if reply == "no":
+                    lines.append(
+                        "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."
+                    )
+                if reply == "end":
+                    lines.append("- **The sender has ended this thread. Do NOT send a mesh reply.**")
+                body = mesh.get("body") or ""
+                if body:
+                    lines.append(f"\nMessage body: {body}")
             block = "\n".join(lines)
         if max_chars and len(block) > max_chars:
             block = block[:max_chars]
@@ -159,7 +169,15 @@ class DiploidMeshPlugin(StatePlugin):
             return None
 
         reply = mesh.get("reply", "no")
-        if reply == "end":
+        if pctx.compact:
+            sender = mesh.get("sender", "unknown")
+            if reply == "end":
+                cta = f"[Mesh: terminal message from `{sender}`. Do not reply.]"
+            elif reply == "no":
+                cta = f"[Mesh: one-way from `{sender}`. Use `mesh_send` only if you must reply.]"
+            else:
+                cta = f"[Mesh: reply to `{sender}` using `mesh_send` only.]"
+        elif reply == "end":
             # Terminal message: no reply needed, but still reinforce silence.
             cta = self._mesh_silence_cta(mesh)
         elif reply == "no":
