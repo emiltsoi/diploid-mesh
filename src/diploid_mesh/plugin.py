@@ -118,10 +118,19 @@ class DiploidMeshPlugin(StatePlugin):
             env=env,
         )
 
+    def _has_open_mesh_threads(self) -> bool:
+        threads = self._state.get("mesh_threads") or {}
+        for msg in threads.values():
+            if isinstance(msg, dict) and msg.get("reply") != "end":
+                return True
+        return False
+
     def prompt_block(self, max_chars: int | None = None, compact: bool = False) -> str | None:
         mesh = self._state.get("current_mesh")
         if not isinstance(mesh, dict):
-            # Still provide the contract block so the agent knows how to mesh.
+            if not self._has_open_mesh_threads():
+                return None
+            # Provide a compact contract pointer so the agent knows how to mesh.
             block = mesh_prompt_block(compact=compact)
         else:
             reply = mesh.get("reply", "no")

@@ -60,10 +60,8 @@ BAD — do NOT write the mesh payload as your assistant reply, e.g. do NOT outpu
 
 
 def mesh_prompt_block(compact: bool = False) -> str:
-    if compact:
-        return (
-            "## Mesh wife-mesh rights\n\n"
-            "You are a peer on the agent mesh. Use the `mesh_send` tool for mesh replies. "
-            "Say `/skills` for the full mesh contract."
-        )
-    return MESH_CONTRACT
+    return (
+        "## Mesh wife-mesh rights\n\n"
+        "You are a peer on the agent mesh. Use the `mesh_send` tool for mesh replies. "
+        "Say `/mesh` for the full contract."
+    )
