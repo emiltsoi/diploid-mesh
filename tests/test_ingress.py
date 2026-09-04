@@ -19,6 +19,7 @@ from diploid_agent.config import (
     Secrets,
     TimerConfig,
 )
+from diploid_agent.plugins.base import TurnInfo
 from diploid_agent.plugins.contexts import PromptContext
 from diploid_agent.runtime.agent_runtime import AgentRuntime
 from diploid_agent.transport.http import create_app
@@ -332,3 +333,58 @@ def test_mesh_send_tracker_floats_to_telegram(tmp_path: Path, monkeypatch) -> No
         "msg_id": "msg-123",
     }
     assert call_args.kwargs["headers"]["X-API-Key"] == "secret"
+
+
+def test_mesh_plugin_after_turn_merges_child_writes(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    chat_id = "mesh:hermes-0"
+    mesh_plugin = _make_mesh_plugin(runtime, chat_id)
+
+    # Simulate the MCP child writing an outbound thread record during the turn,
+    # while the plugin still has an in-memory current_mesh.
+    child_state = {
+        "current_mesh": {
+            "sender": "hermes-0",
+            "body": "ping",
+            "reply": "yes",
+            "message_id": "msg-1",
+            "session": "chat",
+            "from_session": "chat",
+            "direction": "inbound",
+        },
+        "mesh_threads": {
+            "hermes-0": {
+                "sender": "aurelia",
+                "recipient": "hermes-0",
+                "message_id": "msg-2",
+                "session": "chat",
+                "from_session": "chat",
+                "ref": "msg-1",
+                "direction": "outbound",
+                "action": "info",
+                "reply": "yes",
+            }
+        },
+    }
+    mesh_plugin.state_path().parent.mkdir(parents=True, exist_ok=True)
+    mesh_plugin.state_path().write_text(json.dumps(child_state))
+
+    mesh_plugin.after_turn(
+        TurnInfo(
+            chat_id=chat_id,
+            session_id="s1",
+            session_number=1,
+            turn_number=1,
+            updated_at=0.0,
+            last_stop_reason=None,
+            user_message="ping",
+            reply="pong",
+        )
+    )
+
+    final = json.loads(mesh_plugin.state_path().read_text(encoding="utf-8"))
+    assert "current_mesh" not in final
+    assert final["mesh_threads"]["hermes-0"]["message_id"] == "msg-2"
+    assert final["mesh_threads"]["hermes-0"]["direction"] == "outbound"

@@ -215,6 +215,7 @@ class DiploidMeshPlugin(StatePlugin):
         if context.wake_event.reason == "mesh" or payload.get("mesh"):
             mesh = payload.get("mesh", {})
             mesh["_arrived_at"] = time.time()
+            mesh["direction"] = "inbound"
             self._state["current_mesh"] = mesh
             # Keep a durable thread record keyed by sender so a reply can be
             # sent from a later ACP turn after the transient current_mesh is
@@ -233,7 +234,10 @@ class DiploidMeshPlugin(StatePlugin):
         """Clear transient mesh context once the turn is done.
 
         The durable `mesh_threads` map is preserved so multi-turn replies still
-        know which session the original message arrived on.
+        know which session the original message arrived on. We re-read the file
+        first so that any updates the MCP child wrote during the turn (e.g.
+        outbound thread records) are not clobbered.
         """
+        self._state = self._load_state()
         self._state.pop("current_mesh", None)
         self._save_state()

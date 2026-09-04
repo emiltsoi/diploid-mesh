@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +135,46 @@ class MeshSendTracker:
         except (json.JSONDecodeError, OSError):
             return None
 
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_state(self, data: dict[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(data, indent=2, default=str))
+
+    def _record_outbound(
+        self,
+        agent_name: str,
+        recipient: str,
+        msg_id: str,
+        session: str | None,
+        from_session: str | None,
+        ref: str | None,
+        action: str,
+        reply: str,
+    ) -> None:
+        """Persist the outbound message so the next send in the thread can ref it."""
+        data = self._load_state()
+        threads = data.setdefault("mesh_threads", {})
+        threads[recipient] = {
+            "sender": agent_name,
+            "recipient": recipient,
+            "message_id": msg_id,
+            "session": session,
+            "from_session": from_session,
+            "ref": ref,
+            "action": action,
+            "reply": reply,
+            "direction": "outbound",
+            "_sent_at": time.time(),
+        }
+        self._save_state(data)
+
     def _nudge(self, count: int, cap: int) -> str | None:
         if cap > 0 and count >= self.suggestion_threshold and count <= cap:
             if count == cap:
@@ -226,46 +268,59 @@ class DiploidMeshMcpServer:
             ),
         )
 
-    def _infer_reply_sessions(self, recipient: str | None = None) -> tuple[str | None, str | None]:
-        """Return (outbound_session, outbound_from_session) for a mesh message.
+    def _infer_thread(self, recipient: str) -> dict[str, str | None]:
+        """Return default session, from_session, and ref for a mesh_send.
 
-        - If we are replying to an active mesh message, swap its session tokens
-          so the reply goes back on the same door. If the inbound message only
-          carried one token, use it for both directions to keep routing symmetric.
+        - If we are replying to an active mesh message from `recipient`, swap its
+          session tokens so the reply goes back on the same door and set `ref` to
+          the message we are replying to.
+        - If we are continuing a prior outbound thread to `recipient`, keep the
+          same door and `ref` the last message in the thread.
         - Otherwise this is the first message in a thread: use the session name
-          that the current chat maps to for both `session` and `from_session`.
+          that the current chat maps to for both `session` and `from_session`,
+          with no `ref`.
         """
-        state: dict[str, Any] = {}
-        if self.tracker.state_path.exists():
-            try:
-                state = json.loads(self.tracker.state_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+        state = self.tracker._load_state()
 
-        # Prefer the active turn's mesh context, fall back to a durable thread
-        # record for the recipient so multi-turn replies still work.
+        # Prefer the active turn's mesh context when it matches the recipient.
         mesh = state.get("current_mesh") or {}
-        if not mesh and recipient:
+        if not mesh or mesh.get("sender") != recipient:
             mesh = (state.get("mesh_threads") or {}).get(recipient) or {}
 
         inbound_session = mesh.get("session")
         inbound_from_session = mesh.get("from_session")
+        ref = mesh.get("message_id")
 
         if inbound_session or inbound_from_session:
-            # Use whichever token is present as the effective session for both
-            # sides, then swap: the reply is addressed to the sender's session
-            # and tagged with our receiving session.
-            effective = inbound_session or inbound_from_session
-            session = inbound_from_session or effective
-            from_session = inbound_session or effective
-            return session, from_session
+            if mesh.get("direction") == "outbound":
+                # We sent the last message; continue on the same door.
+                session = inbound_session or inbound_from_session
+                from_session = inbound_from_session or inbound_session
+            else:
+                # Replying to an inbound message: swap the tokens.
+                effective = inbound_session or inbound_from_session
+                session = inbound_from_session or effective
+                from_session = inbound_session or effective
+            return {
+                "session": session,
+                "from_session": from_session,
+                "ref": ref,
+            }
 
         # First message in a thread: route to the session this chat is mapped to.
         chat_map = self.mesh.config.config.chat_map
         for name, chat_id in chat_map.items():
             if chat_id == self.chat_id:
-                return name, name
-        return None, None
+                return {
+                    "session": name,
+                    "from_session": name,
+                    "ref": None,
+                }
+        return {
+            "session": None,
+            "from_session": None,
+            "ref": None,
+        }
 
     def _ensure_default_session_map(self) -> None:
         """Map the default `chat` and `review` sessions to the operator chat on first join."""
@@ -436,23 +491,30 @@ class DiploidMeshMcpServer:
                     if not ok:
                         return _tool_result(req_id, f"Mesh send blocked: {hint}", is_error=True)
 
+                    recipient = arguments["agent"]
+                    thread = self._infer_thread(recipient)
+
                     session = arguments.get("session")
                     from_session = arguments.get("from_session")
-                    if session is None or from_session is None:
-                        inferred_session, inferred_from_session = self._infer_reply_sessions(
-                            arguments.get("agent")
-                        )
-                        if session is None:
-                            session = inferred_session
-                        if from_session is None:
-                            from_session = inferred_from_session
+                    ref = arguments.get("ref")
+                    if session is None:
+                        session = thread.get("session")
+                    if from_session is None:
+                        from_session = thread.get("from_session")
+                    if ref is None:
+                        ref = thread.get("ref")
+
+                    action = arguments.get("action", "do")
+                    reply = arguments.get("reply", "yes")
+                    msg_id = str(uuid.uuid4())
 
                     result = self.mesh.send(
-                        recipient=arguments["agent"],
+                        recipient=recipient,
                         body=arguments["message"],
-                        action=arguments.get("action", "do"),
-                        reply=arguments.get("reply", "yes"),
-                        ref=arguments.get("ref"),
+                        action=action,
+                        reply=reply,
+                        ref=ref,
+                        msg_id=msg_id,
                         session=session,
                         from_session=from_session,
                     )
@@ -460,15 +522,27 @@ class DiploidMeshMcpServer:
                         return _tool_result(
                             req_id, f"Delivery failed: {result.error}", is_error=True
                         )
+                    self.tracker._record_outbound(
+                        agent_name=self.mesh.core_config.agent_name,
+                        recipient=recipient,
+                        msg_id=msg_id,
+                        session=session,
+                        from_session=from_session,
+                        ref=ref,
+                        action=action,
+                        reply=reply,
+                    )
                     self.tracker.notify_telegram(
                         sender=self.mesh.core_config.agent_name,
-                        recipient=arguments["agent"],
+                        recipient=recipient,
                         body=arguments["message"],
-                        action=arguments.get("action", "do"),
-                        reply=arguments.get("reply", "yes"),
-                        msg_id=result.delivery_id or "",
+                        action=action,
+                        reply=reply,
+                        msg_id=result.delivery_id or msg_id,
                     )
                     out = f"Delivered: {result.delivery_id}"
+                    if ref:
+                        out = f"{out}\n\nThread ref: {ref}"
                     if hint:
                         out = f"{out}\n\nNote: {hint}"
                     return _tool_result(req_id, out)
