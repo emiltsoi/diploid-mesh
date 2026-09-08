@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from mesh_core.threads import is_closed
 
 from diploid_mesh.config import DiploidMeshConfig
 from diploid_mesh.core import DiploidMesh
@@ -290,6 +291,11 @@ class DiploidMeshMcpServer:
         inbound_session = mesh.get("session")
         inbound_from_session = mesh.get("from_session")
         ref = mesh.get("message_id")
+        if ref and is_closed(ref, vault_path=self.mesh.core_config.vault_path):
+            # The last message in this thread closed it (reply=end); a ref to
+            # it is rejected as THREAD_CLOSED. Start a fresh thread on the
+            # same door instead.
+            ref = None
 
         if inbound_session or inbound_from_session:
             if mesh.get("direction") == "outbound":

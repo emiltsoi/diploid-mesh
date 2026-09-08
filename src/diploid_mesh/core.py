@@ -181,7 +181,6 @@ class DiploidMesh:
 
         if self.replay.has(envelope.msg_id):
             raise ValueError(f"Replay: message {envelope.msg_id} already seen")
-        self.replay.add(envelope.msg_id)
 
         # Enforce THREAD_CLOSED for non-DSN messages.
         is_dsn = (headers.get("x-mesh-dsn") or headers.get("X-Mesh-DSN", "")).lower() in (
@@ -195,6 +194,11 @@ class DiploidMesh:
             and is_closed(envelope.ref, vault_path=self.core_config.vault_path)
         ):
             raise ValueError(f"THREAD_CLOSED: {envelope.ref}")
+
+        # Mark seen only after all rejectable checks pass — a rejected
+        # delivery must not poison the replay cache, or retries surface as
+        # "Replay" instead of the real reason.
+        self.replay.add(envelope.msg_id)
 
         if not is_dsn and envelope.reply == "end":
             record_thread_close(

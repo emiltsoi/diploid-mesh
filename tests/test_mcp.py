@@ -137,6 +137,35 @@ def test_infer_thread_prefers_current_mesh_for_matching_recipient(tmp_path: Path
     assert thread == {"session": "chat", "from_session": "review", "ref": "active-1"}
 
 
+def test_infer_thread_drops_ref_to_closed_thread(tmp_path: Path) -> None:
+    """A ref to a closed thread is rejected as THREAD_CLOSED on receipt —
+    _infer_thread must start a fresh thread instead of ref-ing it."""
+    from mesh_core.threads import record as record_close
+
+    server = _server(tmp_path)
+    _write_state(
+        server,
+        {
+            "mesh_threads": {
+                "vesper": {
+                    "sender": "vesper",
+                    "session": "chat",
+                    "from_session": "review",
+                    "message_id": "closed-anchor-mcp-1",
+                    "direction": "inbound",
+                }
+            },
+        },
+    )
+    record_close(
+        "closed-anchor-mcp-1",
+        "vesper",
+        vault_path=server.mesh.core_config.vault_path,
+    )
+    thread = server._infer_thread("vesper")
+    assert thread == {"session": "review", "from_session": "chat", "ref": None}
+
+
 def test_infer_thread_ignores_current_mesh_for_other_recipient(tmp_path: Path) -> None:
     server = _server(tmp_path)
     _write_state(
