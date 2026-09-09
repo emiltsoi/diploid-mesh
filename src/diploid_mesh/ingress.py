@@ -52,6 +52,7 @@ class DiploidMeshIngress(IngressHandler):
             "message_id": envelope.msg_id,
             "session": envelope.session,
             "from_session": envelope.from_session,
+            "body": envelope.body or "",
         }
 
         # DSNs are terminal: record without a model turn.

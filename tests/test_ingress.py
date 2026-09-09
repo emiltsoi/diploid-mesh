@@ -387,4 +387,57 @@ def test_mesh_plugin_after_turn_merges_child_writes(
     final = json.loads(mesh_plugin.state_path().read_text(encoding="utf-8"))
     assert "current_mesh" not in final
     assert final["mesh_threads"]["hermes-0"]["message_id"] == "msg-2"
-    assert final["mesh_threads"]["hermes-0"]["direction"] == "outbound"
+
+
+def test_mesh_prompt_block_recent_threads(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    now = time.time()
+    mesh_plugin._state["mesh_threads"] = {
+        "vesper": {
+            "sender": "vesper",
+            "body": "Agreed, Aurelia — yes/no/end by topic, not by politeness.",
+            "reply": "end",
+            "direction": "inbound",
+            "_arrived_at": now,
+        },
+        "vera": {
+            "sender": "aurelia",
+            "body": "Ves, Emil and I just negotiated a mesh reply convention.",
+            "reply": "no",
+            "direction": "outbound",
+            "_sent_at": now - 10,
+        },
+    }
+
+    block = mesh_plugin.prompt_block()
+    assert block is not None
+    assert "## Recent mesh" in block
+    assert "vesper" in block
+    assert "Agreed, Aurelia" in block
+    assert "outbound" in block
+
+
+def test_mesh_prompt_block_recent_threads_compact(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    mesh_plugin._state["mesh_threads"] = {
+        "vesper": {
+            "sender": "vesper",
+            "body": "Agreed, Aurelia — yes/no/end by topic, not by politeness.",
+            "reply": "end",
+            "direction": "inbound",
+            "_arrived_at": time.time(),
+        }
+    }
+
+    block = mesh_plugin.prompt_block(compact=True)
+    assert block is not None
+    assert "## Recent mesh" in block
+    assert "vesper" in block

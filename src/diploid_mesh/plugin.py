@@ -125,13 +125,47 @@ class DiploidMeshPlugin(StatePlugin):
                 return True
         return False
 
+    def _recent_mesh_block(self, max_chars: int | None = None, compact: bool = False) -> str | None:
+        threads = self._state.get("mesh_threads") or {}
+        if not threads:
+            return None
+        # Sort by arrival/send time, most recent first.
+        entries = sorted(
+            threads.values(),
+            key=lambda m: m.get("_arrived_at", 0) or m.get("_sent_at", 0),
+            reverse=True,
+        )
+        max_entries = 3 if compact else 5
+        snippet_len = 80 if compact else 120
+        lines: list[str] = ["## Recent mesh"]
+        for msg in entries[:max_entries]:
+            sender = msg.get("sender", "unknown")
+            reply = msg.get("reply", "no")
+            direction = msg.get("direction", "inbound")
+            body = (msg.get("body") or "").strip().replace("\n", " ")
+            snippet = body[:snippet_len] if body else "[body not stored]"
+            if len(body) > snippet_len:
+                snippet = f"{snippet}..."
+            lines.append(f"- `{sender}` ({direction}, reply={reply}): {snippet}")
+        block = "\n".join(lines)
+        if max_chars and len(block) > max_chars:
+            block = block[:max_chars].rsplit("\n", 1)[0]
+        return block
+
     def prompt_block(self, max_chars: int | None = None, compact: bool = False) -> str | None:
         mesh = self._state.get("current_mesh")
         if not isinstance(mesh, dict):
-            if not self._has_open_mesh_threads():
-                return None
-            # Provide a compact contract pointer so the agent knows how to mesh.
-            block = mesh_prompt_block(compact=compact)
+            recent = self._recent_mesh_block(max_chars, compact=compact)
+            contract = mesh_prompt_block(compact=compact)
+            if recent:
+                block = f"{contract}\n\n{recent}"
+            else:
+                if not self._has_open_mesh_threads():
+                    return None
+                block = contract
+            if max_chars and len(block) > max_chars:
+                block = block[:max_chars].rsplit("\n", 1)[0]
+            return block
         else:
             reply = mesh.get("reply", "no")
             if compact:

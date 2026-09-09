@@ -158,6 +158,7 @@ class MeshSendTracker:
         ref: str | None,
         action: str,
         reply: str,
+        body: str,
     ) -> None:
         """Persist the outbound message so the next send in the thread can ref it."""
         data = self._load_state()
@@ -171,6 +172,7 @@ class MeshSendTracker:
             "ref": ref,
             "action": action,
             "reply": reply,
+            "body": body,
             "direction": "outbound",
             "_sent_at": time.time(),
         }
@@ -537,6 +539,7 @@ class DiploidMeshMcpServer:
                         ref=ref,
                         action=action,
                         reply=reply,
+                        body=arguments["message"],
                     )
                     self.tracker.notify_telegram(
                         sender=self.mesh.core_config.agent_name,
