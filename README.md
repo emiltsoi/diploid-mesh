@@ -15,6 +15,7 @@ Bidirectional mesh integration for [diploid-agent](https://github.com/emiltsoi/d
 - Strengthens prompt discipline with a top-of-prompt `SYSTEM — MESH REPLY RULE` CTA that commands the agent to use `mesh_send` and keep mesh traffic out of normal assistant text.
 - Mirrors sent mesh messages to Telegram as `System: [mesh] ...` notices when `harness.notifications.mesh_telegram_float` is enabled.
 - Stores per-chat mesh state (`chat_mesh_state.json`) and a prompt block teaching the agent the CTA contract.
+- Surfaces a `## Recent mesh` block with the most recent open or closed threads so the agent has thread context even when the transient `current_mesh` has been cleared.
 - Relies on [`mesh-peer-registry`](https://github.com/emiltsoi/mesh-peer-registry) for shared envelope parsing, identity, crypto, and registry primitives.
 
 ## Install
