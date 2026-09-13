@@ -441,3 +441,56 @@ def test_mesh_prompt_block_recent_threads_compact(
     assert block is not None
     assert "## Recent mesh" in block
     assert "vesper" in block
+
+
+def test_mesh_prompt_block_recent_threads_shows_age(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    mesh_plugin._state["mesh_threads"] = {
+        "vesper": {
+            "sender": "vesper",
+            "body": "closing the convention thread.",
+            "reply": "end",
+            "direction": "inbound",
+            "_arrived_at": time.time() - 7200,
+        }
+    }
+
+    block = mesh_plugin.prompt_block()
+    assert block is not None
+    assert "2h ago" in block
+
+
+def test_mesh_prompt_block_recent_threads_excludes_actionable(
+    client_runtime: tuple[TestClient, AgentRuntime],
+) -> None:
+    """reply=yes threads are actionable and surface via the CTA, not the digest."""
+    _client, runtime = client_runtime
+    mesh_plugin = _make_mesh_plugin(runtime, "mesh:hermes-0")
+
+    now = time.time()
+    mesh_plugin._state["mesh_threads"] = {
+        "vesper": {
+            "sender": "vesper",
+            "body": "please answer this actionable thread",
+            "reply": "yes",
+            "direction": "inbound",
+            "_arrived_at": now,
+        },
+        "agent0": {
+            "sender": "agent0",
+            "body": "one-way status update",
+            "reply": "no",
+            "direction": "inbound",
+            "_arrived_at": now - 60,
+        },
+    }
+
+    block = mesh_plugin.prompt_block()
+    assert block is not None
+    assert "## Recent mesh" in block
+    assert "agent0" in block
+    assert "please answer this actionable thread" not in block

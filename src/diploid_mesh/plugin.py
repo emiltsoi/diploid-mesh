@@ -125,13 +125,28 @@ class DiploidMeshPlugin(StatePlugin):
                 return True
         return False
 
+    @staticmethod
+    def _rel_age(ts: float) -> str:
+        """Render a thread timestamp as a short relative age."""
+        delta = max(0.0, time.time() - ts)
+        if delta < 3600:
+            return f"{int(delta // 60)}m ago"
+        if delta < 86400:
+            return f"{delta / 3600:.0f}h ago"
+        return f"{delta / 86400:.0f}d ago"
+
     def _recent_mesh_block(self, max_chars: int | None = None, compact: bool = False) -> str | None:
         threads = self._state.get("mesh_threads") or {}
-        if not threads:
+        # Actionable reply=yes threads are surfaced through the active-mesh
+        # block and the reply CTA; the digest is for closed/one-way traffic so
+        # it can shape context without demanding a response.
+        entries = [
+            msg for msg in threads.values() if isinstance(msg, dict) and msg.get("reply") != "yes"
+        ]
+        if not entries:
             return None
         # Sort by arrival/send time, most recent first.
-        entries = sorted(
-            threads.values(),
+        entries.sort(
             key=lambda m: m.get("_arrived_at", 0) or m.get("_sent_at", 0),
             reverse=True,
         )
@@ -142,11 +157,13 @@ class DiploidMeshPlugin(StatePlugin):
             sender = msg.get("sender", "unknown")
             reply = msg.get("reply", "no")
             direction = msg.get("direction", "inbound")
+            ts = msg.get("_arrived_at") or msg.get("_sent_at") or 0
+            when = self._rel_age(ts) if ts else "unknown age"
             body = (msg.get("body") or "").strip().replace("\n", " ")
             snippet = body[:snippet_len] if body else "[body not stored]"
             if len(body) > snippet_len:
                 snippet = f"{snippet}..."
-            lines.append(f"- `{sender}` ({direction}, reply={reply}): {snippet}")
+            lines.append(f"- `{sender}` ({direction}, reply={reply}, {when}): {snippet}")
         block = "\n".join(lines)
         if max_chars and len(block) > max_chars:
             block = block[:max_chars].rsplit("\n", 1)[0]
@@ -196,7 +213,9 @@ class DiploidMeshPlugin(StatePlugin):
                         "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."
                     )
                 if reply == "end":
-                    lines.append("- **The sender has ended this thread. Do NOT send a mesh reply.**")
+                    lines.append(
+                        "- **The sender has ended this thread. Do NOT send a mesh reply.**"
+                    )
                 body = mesh.get("body") or ""
                 if body:
                     lines.append(f"\nMessage body: {body}")
