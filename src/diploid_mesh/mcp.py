@@ -125,17 +125,6 @@ class MeshSendTracker:
         except (json.JSONDecodeError, OSError):
             return None
 
-    def _current_mesh_reply(self) -> str | None:
-        """Read current_mesh.reply from the plugin state file, if present."""
-        if not self.state_path.exists():
-            return None
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-            mesh = data.get("current_mesh") or {}
-            return mesh.get("reply")
-        except (json.JSONDecodeError, OSError):
-            return None
-
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
             return {}
@@ -192,12 +181,11 @@ class MeshSendTracker:
         return None
 
     def allowed(self) -> tuple[bool, str | None]:
-        # The reply value lives on disk and is available even if the harness
-        # is unreachable. reply=end is an absolute block.
-        incoming_reply = self._current_mesh_reply()
-        if incoming_reply == "end":
-            return False, "This message has reply=end; do not send a mesh reply."
-
+        # No turn-level block on the inbound message's reply flag: a reply=end
+        # wake must not forbid new threads or sends to other recipients.
+        # Closed threads are enforced on the ref axis instead — _infer_thread
+        # drops inferred refs to closed messages and the receiver rejects
+        # explicit refs as THREAD_CLOSED.
         status = self._turn_status()
         if status is None:
             status = {}

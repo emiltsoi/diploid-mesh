@@ -62,7 +62,10 @@ def test_tracker_allows_until_cap_and_nudges() -> None:
 
 
 @respx.mock
-def test_tracker_blocks_reply_end() -> None:
+def test_tracker_allows_send_on_reply_end_turn() -> None:
+    """A turn woken by reply=end may still send — the contract allows a new
+    thread with a fresh ref; closed-thread refs are rejected downstream as
+    THREAD_CLOSED, not gated here on the inbound flag."""
     state = Path("/tmp/test_mesh_state_end.json")
     state.write_text(json.dumps({"current_mesh": {"reply": "end"}}))
     route = respx.get("http://127.0.0.1:4003/turn/mesh:test").mock(
@@ -76,10 +79,8 @@ def test_tracker_blocks_reply_end() -> None:
         )
     )
     tracker = _tracker(state_path=state)
-    allowed, err = tracker.allowed()
-    assert allowed is False
-    assert err and "reply=end" in err
-    assert not route.called
+    assert tracker.allowed() == (True, None)
+    assert route.called
 
 
 @respx.mock

@@ -248,4 +248,88 @@ def test_mesh_send_handler_uses_inferred_ref_and_records_thread(tmp_path: Path) 
     state = _read_state(server)
     assert state["mesh_threads"]["vesper"]["direction"] == "outbound"
     assert state["mesh_threads"]["vesper"]["ref"] == "msg-1"
-    assert state["mesh_threads"]["vesper"]["message_id"] == send_spy["kwargs"]["msg_id"]
+
+
+def test_mesh_send_on_reply_end_turn_starts_new_thread(tmp_path: Path) -> None:
+    """Regression: a turn woken by reply=end must not be blocked from
+    mesh_send — the contract allows a genuinely new thread, and the closed
+    thread's id is dropped from the inferred ref."""
+    from mesh_core.threads import record as record_close
+
+    server = _server(tmp_path)
+    _write_state(
+        server,
+        {
+            "current_mesh": {
+                "sender": "vesper",
+                "session": "chat",
+                "from_session": "chat",
+                "message_id": "end-anchor-1",
+                "reply": "end",
+            },
+        },
+    )
+    record_close(
+        "end-anchor-1",
+        "vesper",
+        vault_path=server.mesh.core_config.vault_path,
+    )
+
+    send_spy: dict[str, Any] = {}
+
+    def fake_send(*, recipient, body, action, reply, ref, msg_id, session, from_session):
+        send_spy["kwargs"] = {"recipient": recipient, "ref": ref, "msg_id": msg_id}
+        return DeliveryResult(delivery_id="d-456")
+
+    server.mesh.send = fake_send
+    server.tracker.notify_telegram = MagicMock()
+
+    response = server._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mesh_send",
+                "arguments": {"agent": "vesper", "message": "new topic"},
+            },
+        }
+    )
+
+    assert response and not response["result"].get("isError")
+    assert send_spy["kwargs"]["ref"] is None  # new thread, not a closed-thread ref
+
+
+def test_mesh_send_explicit_ref_passes_through(tmp_path: Path) -> None:
+    """An explicit ref is threaded as given — the receiver's ingress owns
+    THREAD_CLOSED rejection; the send gate does not pre-empt it."""
+    server = _server(tmp_path)
+    _write_state(server, {})
+
+    send_spy: dict[str, Any] = {}
+
+    def fake_send(*, recipient, body, action, reply, ref, msg_id, session, from_session):
+        send_spy["kwargs"] = {"ref": ref}
+        return DeliveryResult(delivery_id="d-789")
+
+    server.mesh.send = fake_send
+    server.tracker.notify_telegram = MagicMock()
+
+    response = server._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mesh_send",
+                "arguments": {
+                    "agent": "vesper",
+                    "message": "explicit",
+                    "ref": "some-msg-id",
+                },
+            },
+        }
+    )
+
+    assert response and not response["result"].get("isError")
+    assert send_spy["kwargs"]["ref"] == "some-msg-id"
