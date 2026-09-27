@@ -12,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from diploid_mesh.config import DiploidMeshConfig
-from diploid_mesh.core import DiploidMesh
+from diploid_mesh.core import DiploidMesh, ReplaySeenError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,16 @@ class DiploidMeshIngress(IngressHandler):
 
         try:
             envelope = await run_in_threadpool(self.mesh.verify_request, headers, body)
+        except ReplaySeenError as exc:
+            # Idempotent accept: replay.add only runs after every rejectable
+            # check passes, so "already seen" proves the envelope was accepted
+            # before. A 400 here makes senders hear failure for a delivered
+            # letter whenever a response is lost mid-flight.
+            logger.info("[diploid-mesh] duplicate delivery: %s", exc.msg_id)
+            return JSONResponse(
+                {"status": "duplicate", "delivery_id": exc.msg_id},
+                status_code=202,
+            )
         except ValueError as exc:
             logger.warning("[diploid-mesh] rejected inbound: %s", exc)
             return JSONResponse({"status": "rejected", "reason": str(exc)}, status_code=400)

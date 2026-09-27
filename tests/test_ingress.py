@@ -184,6 +184,42 @@ def test_mesh_receive_triggers_wake(tmp_path: Path, client: TestClient) -> None:
     assert body["chat_id"] == "mesh:hermes-0"
 
 
+def test_mesh_receive_duplicate_is_idempotent_accept(tmp_path: Path, client: TestClient) -> None:
+    """A redelivery of an already-accepted envelope returns 202 'duplicate',
+    not 400 — a response lost mid-flight must not read as failure upstream."""
+    private, public = generate_keypair()
+    vault = tmp_path / "mesh-vault"
+    first = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "Hello from Hermes",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault,
+        msg_id="dup-msg-1",
+    )
+    assert first.status_code == 202, first.text
+    assert first.json()["status"] == "accepted"
+
+    second = _sign_and_send(
+        client,
+        private,
+        "hermes-0",
+        "diploid-0",
+        "Hello from Hermes",
+        public_pem=public,
+        sender_identity={},
+        vault_path=vault,
+        msg_id="dup-msg-1",
+    )
+    assert second.status_code == 202, second.text
+    body = second.json()
+    assert body["status"] == "duplicate"
+    assert body["delivery_id"] == "dup-msg-1"
+
+
 def test_mesh_receive_reply_classifications(
     tmp_path: Path, client_runtime: tuple[TestClient, AgentRuntime], monkeypatch
 ) -> None:

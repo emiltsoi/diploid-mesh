@@ -34,6 +34,21 @@ def _is_telegram_chat_id(chat_id: str | None) -> bool:
     return chat_id.lstrip("-").isdigit()
 
 
+class ReplaySeenError(ValueError):
+    """Envelope msg_id was already accepted.
+
+    Raised by ``verify_request`` when the replay window has seen the id.
+    ``replay.add`` runs only after every rejectable check passes, so an
+    "already seen" hit is proof of prior acceptance — the ingress maps it
+    to an idempotent ``202 {"status": "duplicate"}`` rather than a 400,
+    which makes a response-lost retry report delivered instead of failed.
+    """
+
+    def __init__(self, msg_id: str) -> None:
+        super().__init__(f"Replay: message {msg_id} already seen")
+        self.msg_id = msg_id
+
+
 class DiploidMesh:
     """Runtime handle for a diploid-agent mesh peer."""
 
@@ -180,7 +195,7 @@ class DiploidMesh:
             raise ValueError("Ed25519 signature verification failed")
 
         if self.replay.has(envelope.msg_id):
-            raise ValueError(f"Replay: message {envelope.msg_id} already seen")
+            raise ReplaySeenError(envelope.msg_id)
 
         # Enforce THREAD_CLOSED for non-DSN messages.
         is_dsn = (headers.get("x-mesh-dsn") or headers.get("X-Mesh-DSN", "")).lower() in (

@@ -13,7 +13,7 @@ from mesh_core.identity import MeshIdentity
 from mesh_core.threads import record as record_close
 
 from diploid_mesh.config import DiploidMeshConfig
-from diploid_mesh.core import DiploidMesh
+from diploid_mesh.core import DiploidMesh, ReplaySeenError
 
 
 def _mesh(tmp_path: Path) -> DiploidMesh:
@@ -111,8 +111,9 @@ def test_accepted_message_is_replay_protected(tmp_path: Path) -> None:
 
     envelope = mesh.verify_request(headers, body)
     assert envelope.msg_id == "ok-msg-1"
-    with pytest.raises(ValueError, match="Replay"):
+    with pytest.raises(ReplaySeenError) as excinfo:
         mesh.verify_request(headers, body)
+    assert excinfo.value.msg_id == "ok-msg-1"
 
 
 def test_reply_end_records_close_after_seen(tmp_path: Path) -> None:
