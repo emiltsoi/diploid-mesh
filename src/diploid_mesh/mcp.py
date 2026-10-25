@@ -694,6 +694,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # MCP stdio is UTF-8 JSON-RPC, but on Windows the child inherits the
+    # locale codec (e.g. GBK+surrogateescape): a UTF-8 em-dash arrives as
+    # <GBK char>\udc94, and that lone surrogate wedges any downstream
+    # json.dumps().encode("utf-8"). 'replace' keeps a malformed byte lossy
+    # but valid instead of emitting an unencodable surrogate.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8")
+
     mesh_config = _mesh_config_from_env(args.harness_url)
     server = DiploidMeshMcpServer(mesh_config, args)
     server.run()
