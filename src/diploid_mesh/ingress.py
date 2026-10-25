@@ -11,8 +11,9 @@ from fastapi import Request, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
+from diploid_mesh import open_threads
 from diploid_mesh.config import DiploidMeshConfig
-from diploid_mesh.core import DiploidMesh, ReplaySeenError
+from diploid_mesh.core import DiploidMesh, GateRefusal, ReplaySeenError
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,12 @@ class DiploidMeshIngress(IngressHandler):
                 {"status": "duplicate", "delivery_id": exc.msg_id},
                 status_code=202,
             )
+        except GateRefusal as exc:
+            # Typed refusal (N6) — the body IS the refusal: reason, the
+            # blocking lease's fields, and the reroute address. Refusals
+            # never reach the replay cache or the wake queue.
+            logger.info("[diploid-mesh] gate refusal: %s", exc.detail)
+            return JSONResponse({"status": "refused", **exc.detail}, status_code=exc.status_code)
         except ValueError as exc:
             logger.warning("[diploid-mesh] rejected inbound: %s", exc)
             return JSONResponse({"status": "rejected", "reason": str(exc)}, status_code=400)
@@ -60,6 +67,7 @@ class DiploidMeshIngress(IngressHandler):
             "reply": envelope.reply,
             "ref": envelope.ref,
             "message_id": envelope.msg_id,
+            "thread_id": getattr(envelope, "thread_id", None),
             "session": envelope.session,
             "from_session": envelope.from_session,
             "body": envelope.body or "",
@@ -106,7 +114,23 @@ class DiploidMeshIngress(IngressHandler):
             silent=False,
             ready=True,
         )
-        self.runtime.wake_queue.enqueue(event)
+        try:
+            self.runtime.wake_queue.enqueue(event)
+        except Exception:
+            # Give-up release (N4): a claim minted by THIS delivery is
+            # dropped so the slot is not leaked by a wake we could not
+            # start. A merged lease predates the request and stays.
+            if getattr(envelope, "gate_created", False):
+                open_threads.release_pair(
+                    envelope.sender,
+                    envelope.recipient,
+                    vault_path=self.mesh.core_config.vault_path,
+                )
+            logger.exception("[diploid-mesh] wake enqueue failed; lease released")
+            return JSONResponse(
+                {"status": "error", "reason": "wake enqueue failed"},
+                status_code=500,
+            )
 
         # Return 202 immediately. The TimerService (or any waker subscribed to
         # the event bus) will pop the due wake and run it on its own single

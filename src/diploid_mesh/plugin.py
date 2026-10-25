@@ -212,6 +212,8 @@ class DiploidMeshPlugin(StatePlugin):
                     lines.append(f"- from_session: `{mesh['from_session']}`")
                 if mesh.get("ref"):
                     lines.append(f"- ref: `{mesh['ref']}`")
+                if mesh.get("thread_id"):
+                    lines.append(f"- thread: `{mesh['thread_id']}`")
                 if reply == "no":
                     lines.append(
                         "- **This is a one-way message. Do the work locally. Only send a mesh reply in an exceptional case."

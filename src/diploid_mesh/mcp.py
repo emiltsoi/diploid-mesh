@@ -521,8 +521,19 @@ class DiploidMeshMcpServer:
                         from_session=from_session,
                     )
                     if result.error:
+                        detail = getattr(result, "detail", None) or {}
+                        hint_detail = ""
+                        if detail.get("reason") == "busy" and detail.get("retry_after"):
+                            hint_detail = (
+                                f" — {recipient} is busy on another thread until "
+                                f"{detail['retry_after']}; retry after then"
+                            )
+                        elif detail.get("reason"):
+                            hint_detail = f" — {detail['reason']}"
                         return _tool_result(
-                            req_id, f"Delivery failed: {result.error}", is_error=True
+                            req_id,
+                            f"Delivery failed: {result.error}{hint_detail}",
+                            is_error=True,
                         )
                     self.tracker._record_outbound(
                         agent_name=self.mesh.core_config.agent_name,
