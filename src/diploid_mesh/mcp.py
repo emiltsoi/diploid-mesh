@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 from mesh_core.threads import is_closed
 
+from diploid_mesh._paths import safe_dir_name
 from diploid_mesh.config import DiploidMeshConfig
 from diploid_mesh.core import DiploidMesh
 
@@ -237,16 +238,17 @@ class DiploidMeshMcpServer:
         config = DiploidMeshConfig(config.config, harness_url=effective_harness)
         self.mesh = DiploidMesh(config)
         self.chat_id = args.chat_id
+        joined = False
         if config.auto_join:
             try:
                 result = self.mesh.join_mesh()
                 if not result.get("ok"):
                     logger.warning("mesh auto_join returned: %s", result)
                 else:
-                    self._ensure_default_session_map()
+                    joined = True
             except Exception:
                 logger.exception("mesh auto_join failed")
-        state_dir = Path(args.sessions_root) / args.chat_id.replace("/", "_")
+        state_dir = Path(args.sessions_root) / safe_dir_name(args.chat_id)
         state_path = state_dir / (args.state_file or "chat_mesh_state.json")
         self.tracker = MeshSendTracker(
             chat_id=args.chat_id,
@@ -258,6 +260,10 @@ class DiploidMeshMcpServer:
                 os.getenv("MESH_MAX_MESSAGE_IN_TURN_SUGGESTION", "2")
             ),
         )
+        if joined:
+            # Needs self.tracker — set the default chat/review session map
+            # only after the tracker exists.
+            self._ensure_default_session_map()
 
     def _infer_thread(self, recipient: str) -> dict[str, str | None]:
         """Return default session, from_session, and ref for a mesh_send.
@@ -654,6 +660,12 @@ def _mesh_config_from_env(harness_url: str = "") -> DiploidMeshConfig:
         mesh.registry_url = os.getenv("MESH_REGISTRY_URL")
     if os.getenv("MESH_REGISTRY_PIN"):
         mesh.registry_pin = os.getenv("MESH_REGISTRY_PIN")
+    if os.getenv("MESH_ALLOW_INSECURE_REGISTRY") or os.getenv("MESH_REGISTRY_ALLOW_INSECURE"):
+        mesh.allow_insecure_registry = os.getenv("MESH_ALLOW_INSECURE_REGISTRY", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ) or os.getenv("MESH_REGISTRY_ALLOW_INSECURE", "").lower() in ("1", "true", "yes")
     if os.getenv("MESH_ALLOW_LOOPBACK"):
         mesh.allow_loopback = os.getenv("MESH_ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
     if os.getenv("MESH_CHAT_MAPPING"):
@@ -681,6 +693,14 @@ def main() -> None:
         help="URL of the diploid-agent harness. Defaults to HARNESS_URL env var.",
     )
     args = parser.parse_args()
+
+    # MCP stdio is UTF-8 JSON-RPC, but on Windows the child inherits the
+    # locale codec (e.g. GBK+surrogateescape): a UTF-8 em-dash arrives as
+    # <GBK char>\udc94, and that lone surrogate wedges any downstream
+    # json.dumps().encode("utf-8"). 'replace' keeps a malformed byte lossy
+    # but valid instead of emitting an unencodable surrogate.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8")
 
     mesh_config = _mesh_config_from_env(args.harness_url)
     server = DiploidMeshMcpServer(mesh_config, args)
