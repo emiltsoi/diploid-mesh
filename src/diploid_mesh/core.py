@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Delivery reasons that mean the recipient actively refused (everything
 # else maps to a transport-level failure for the N10 meter).
-_REFUSAL_REASONS = {"busy", "bad-request", "conflict"}
+_REFUSAL_REASONS = {"busy", "bad-request"}
 
 
 def _is_telegram_chat_id(chat_id: str | None) -> bool:
@@ -221,7 +221,15 @@ class DiploidMesh:
         if self.replay.has(envelope.msg_id):
             raise ReplaySeenError(envelope.msg_id)
 
-        # Enforce THREAD_CLOSED for non-DSN messages.
+        if envelope.recipient != self.core_config.agent_name:
+            # A misaddressed POST must not mint foreign-pair leases.
+            raise ValueError(
+                f"misaddressed: to={envelope.recipient} is not {self.core_config.agent_name}"
+            )
+
+        # Enforce THREAD_CLOSED for non-DSN messages. The X-Mesh-DSN header
+        # is sender-controlled — a DSN bypasses the gate and the close path
+        # entirely (fine on a mutually-authenticated fleet; noted, not enforced).
         is_dsn = (headers.get("x-mesh-dsn") or headers.get("X-Mesh-DSN", "")).lower() in (
             "1",
             "true",
@@ -232,7 +240,15 @@ class DiploidMesh:
             and envelope.ref
             and is_closed(envelope.ref, vault_path=self.core_config.vault_path)
         ):
-            raise ValueError(f"THREAD_CLOSED: {envelope.ref}")
+            raise GateRefusal(
+                {
+                    "reason": "thread-closed",
+                    "anchor": envelope.ref,
+                    "peer": envelope.recipient,
+                    "reroute": {"action": "new-thread", "drop": "ref"},
+                },
+                status_code=400,
+            )
 
         # Thread gate (N3, distributed shape): the whole decision — pair
         # match, busy check, claim — is one locked operation here at
@@ -256,20 +272,6 @@ class DiploidMesh:
         # "Replay" instead of the real reason.
         self.replay.add(envelope.msg_id)
 
-        if not is_dsn and envelope.reply == "end":
-            record_thread_close(
-                envelope.msg_id,
-                self.core_config.agent_name,
-                vault_path=self.core_config.vault_path,
-            )
-            # A close for any message in a live pair releases that pair's
-            # lease (spec §10.2 — the pair is the identity, not the id).
-            open_threads.release_pair(
-                envelope.sender,
-                envelope.recipient,
-                vault_path=self.core_config.vault_path,
-            )
-
         # N1 — surface the thread id where the recipient can read it.
         # MeshEnvelope is a frozen dataclass; object.__setattr__ attaches a
         # process-local attribute the ingress folds into the wake payload.
@@ -279,6 +281,29 @@ class DiploidMesh:
             object.__setattr__(envelope, "gate_created", True)
 
         return envelope
+
+    def commit_terminator(self, envelope: MeshEnvelope) -> None:
+        """Record a reply=end close and release the pair's lease.
+
+        Called by the ingress AFTER the wake is enqueued — a close must
+        never exist while the message carrying it has not actually been
+        handed onward (N8's property, applied to the receive side). If the
+        enqueue fails the sender's retry still lands.
+        """
+        if envelope.reply != "end":
+            return
+        record_thread_close(
+            envelope.msg_id,
+            self.core_config.agent_name,
+            vault_path=self.core_config.vault_path,
+        )
+        # A close for any message in a live pair releases that pair's
+        # lease (spec §10.2 — the pair is the identity, not the id).
+        open_threads.release_pair(
+            envelope.sender,
+            envelope.recipient,
+            vault_path=self.core_config.vault_path,
+        )
 
     def send(
         self,

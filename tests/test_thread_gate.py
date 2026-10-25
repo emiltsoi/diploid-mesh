@@ -144,6 +144,18 @@ def test_a2_opener_is_not_busy_both_replies_deliver(tmp_path: Path) -> None:
     assert b.action == "deliver", "reply from the other peer must not be refused"
 
 
+def test_a2b_recipient_opened_lease_does_not_busy_third_party(tmp_path: Path) -> None:
+    """The §8.1 discriminator A2 alone cannot reach: with ONLY a
+    recipient-opened lease live, an unrelated sender must still deliver.
+    The wrong busy reading ('in any thread = busy') refuses bob here."""
+    vault = tmp_path / "vault"
+    open_threads.claim_outbound(me="receiver", peer="alice", vault_path=vault)
+
+    out = _gate(tmp_path, "bob")
+    assert out.action == "deliver"
+    assert out.entry["opened_by"] == "bob"
+
+
 # --- A3: third party refused while a lease is live — typed, with address ---
 
 
@@ -259,7 +271,8 @@ def test_a8_second_terminator_on_closed_thread_refused(tmp_path: Path) -> None:
         msg_id="end-1",
         reply="end",
     )
-    mesh.verify_request(h1, b1)
+    env = mesh.verify_request(h1, b1)
+    mesh.commit_terminator(env)  # ingress records the close post-enqueue
     assert is_closed("end-1", vault_path=mesh.core_config.vault_path)
 
     h2, b2 = _signed_request(
@@ -270,15 +283,20 @@ def test_a8_second_terminator_on_closed_thread_refused(tmp_path: Path) -> None:
         reply="end",
         ref="end-1",
     )
-    with pytest.raises(ValueError, match="THREAD_CLOSED"):
+    with pytest.raises(GateRefusal) as exc:
         mesh.verify_request(h2, b2)
+    assert exc.value.detail["reason"] == "thread-closed"
+    assert exc.value.status_code == 400
 
 
 # --- A9: two refusal predicaments carry different, followable addresses ---
 
 
 def test_a9_refusal_addresses_differ_and_each_works(tmp_path: Path) -> None:
-    _mesh(tmp_path)
+    mesh = _mesh(tmp_path)
+    private, public = generate_keypair()
+    _register_peer(mesh, "alice", public)
+    vault = tmp_path / "vault"
 
     # Predicament 1 — busy: the address is the blocking lease's expiry.
     _seed_lease(tmp_path, "xenia", "receiver")
@@ -286,17 +304,40 @@ def test_a9_refusal_addresses_differ_and_each_works(tmp_path: Path) -> None:
     assert busy.action == "refuse"
     busy_addr = busy.refusal["retry_after"]
 
-    # Predicament 2 — closed thread: the address is "resend without ref".
+    # Predicament 2 — closed thread: the address comes from a REAL second
+    # refusal, not a literal — resend as a new thread, dropping the ref.
     from mesh_core.threads import record as record_close
 
-    record_close("closed-1", "xenia", vault_path=tmp_path / "vault")
-    assert is_closed("closed-1", vault_path=tmp_path / "vault")
+    record_close("closed-1", "xenia", vault_path=vault)
+    h, b = _signed_request(
+        sender_private=private,
+        sender="alice",
+        recipient="receiver",
+        msg_id="late-1",
+        ref="closed-1",
+    )
+    with pytest.raises(GateRefusal) as exc:
+        mesh.verify_request(h, b)
+    closed = exc.value.detail
+    assert closed["reason"] == "thread-closed"
+    closed_addr = closed["reroute"]["action"]
 
-    assert busy_addr != "resend-without-ref"
+    # The two predicaments carry different addresses.
+    assert closed_addr != busy_addr
 
     # Follow the busy address: after lease_until the gate opens.
     out = _gate(tmp_path, "alice", now=busy_addr + 1)
     assert out.action == "deliver"
+
+    # Follow the closed address: resend as a new thread (no ref) delivers.
+    h2, b2 = _signed_request(
+        sender_private=private,
+        sender="alice",
+        recipient="receiver",
+        msg_id="fresh-1",
+    )
+    env = mesh.verify_request(h2, b2)
+    assert env.msg_id == "fresh-1"
 
 
 # --- A10: notice to a busy recipient delivers, and never claims ---

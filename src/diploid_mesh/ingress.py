@@ -117,20 +117,27 @@ class DiploidMeshIngress(IngressHandler):
         try:
             self.runtime.wake_queue.enqueue(event)
         except Exception:
-            # Give-up release (N4): a claim minted by THIS delivery is
-            # dropped so the slot is not leaked by a wake we could not
-            # start. A merged lease predates the request and stays.
+            # Give-up (N4): a claim minted by THIS delivery is dropped so
+            # the slot is not leaked by a wake we could not start, and the
+            # replay mark is discarded so the sender's retry verifies fresh
+            # instead of being swallowed as a duplicate. A merged lease
+            # predates the request and stays.
             if getattr(envelope, "gate_created", False):
                 open_threads.release_pair(
                     envelope.sender,
                     envelope.recipient,
                     vault_path=self.mesh.core_config.vault_path,
                 )
+            self.mesh.replay.discard(envelope.msg_id)
             logger.exception("[diploid-mesh] wake enqueue failed; lease released")
             return JSONResponse(
                 {"status": "error", "reason": "wake enqueue failed"},
                 status_code=500,
             )
+
+        # The terminator's close lands only once its wake exists — a close
+        # must never outlive the message carrying it (N8, receive side).
+        self.mesh.commit_terminator(envelope)
 
         # Return 202 immediately. The TimerService (or any waker subscribed to
         # the event bus) will pop the due wake and run it on its own single
