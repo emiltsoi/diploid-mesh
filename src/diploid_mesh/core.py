@@ -343,11 +343,28 @@ class DiploidMesh:
         claim_entry = None
         claim_created = False
         if target_url and reply not in ("no", "end"):
-            claim_entry, claim_created = open_threads.claim_outbound(
+            claim = open_threads.claim_outbound(
                 me=self.core_config.agent_name,
                 peer=recipient,
                 vault_path=self.core_config.vault_path,
             )
+            if claim.action == "refuse":
+                # Shared-registry deployments contest the pair at claim
+                # time (§11): the recipient holds a live lease opened by a
+                # third party, so the send never reaches the wire. The
+                # typed refusal body is identical to the wire refusal.
+                refusal = claim.refusal or {}
+                result = DeliveryResult(error="busy", detail=refusal)
+                self._meter(
+                    agent=recipient,
+                    action=action,
+                    reply=reply,
+                    thread=refusal.get("thread_id"),
+                    outcome="refused",
+                )
+                return result
+            claim_entry = claim.entry
+            claim_created = claim.created
         elif not target_url:
             result = DeliveryResult(error="not-found")
             self._meter(agent=recipient, action=action, reply=reply, outcome="failed")

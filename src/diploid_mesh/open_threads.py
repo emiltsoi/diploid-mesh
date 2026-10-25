@@ -230,12 +230,22 @@ def claim_outbound(
     peer: str,
     vault_path: str | Path | None = None,
     now: float | None = None,
-) -> tuple[dict, bool]:
-    """Sender-side claim (N3): merge with a live pair row or create one.
+) -> GateOutcome:
+    """Sender-side claim (N3): merge with a live pair row, refuse on busy,
+    or create one.
 
-    Returns ``(entry, created)``. ``created`` tells the caller whether the
-    row was minted by this send — only a created claim may be released when
-    the transport gives up (N4); a merged row predates this send.
+    The §3 busy predicate runs here too, not only at inbound_gate — under
+    a shared registry file the claim is the contested act (spec §11): a
+    pre-minted pair row would pair-match the sender's own envelope at the
+    receiver's gate, making the wire busy-check a dead letter. Order
+    mirrors inbound_gate — pair first (an opener is never self-busy),
+    then busy on a live row where ``peer`` is the recipient and
+    ``opened_by`` is somebody else. ``GateOutcome.created`` tells the
+    caller whether the row was minted by this send — only a created claim
+    may be released when the transport gives up (N4); a merged row
+    predates this send. In a per-seat registry the busy check is a no-op:
+    the only ``peer == target`` rows a sender's file can hold are her own
+    pair rows.
     """
     now = time.time() if now is None else now
     path = _registry_path(vault_path)
@@ -246,11 +256,21 @@ def claim_outbound(
             existing["lease_until"] = now + float(existing.get("lease_minutes", 30)) * 60
             existing["replies"] = int(existing.get("replies", 0)) + 1
             _write_entries(entries, path)
-            return existing, False
+            return GateOutcome("deliver", entry=existing)
+        busy = next(
+            (
+                e
+                for e in entries
+                if _live(e, now) and e.get("peer") == peer and e.get("opened_by") != me
+            ),
+            None,
+        )
+        if busy is not None:
+            return _busy_refusal(busy, peer)
         entry = _new_lease(me, peer, now, _lease_minutes())
         entries.append(entry)
         _write_entries(entries, path)
-        return entry, True
+        return GateOutcome("deliver", entry=entry, created=True)
 
 
 def release_pair(a: str, b: str, *, vault_path: str | Path | None = None) -> int:

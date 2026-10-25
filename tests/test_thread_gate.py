@@ -179,6 +179,82 @@ def test_a3_refusal_does_not_create_claim(tmp_path: Path) -> None:
     assert pairs == []
 
 
+# --- Claim-side busy: under a shared registry the claim is the contested act (§11) ---
+
+
+def test_claim_outbound_refuses_when_recipient_busy(tmp_path: Path) -> None:
+    """A live third-party lease on the recipient refuses the send before
+    the wire. Without this check the minted pair row pair-matches the
+    sender's own envelope at the receiver's gate and the wire busy-check
+    never runs — the shared-file dead letter §11 warns about."""
+    lease = _seed_lease(tmp_path, "xenia", "receiver")
+    out = open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    assert out.action == "refuse"
+    d = out.refusal
+    assert d["reason"] == "busy"
+    assert d["thread_id"] == lease["thread_id"]
+    assert d["retry_after"] == lease["lease_until"]
+
+
+def test_claim_outbound_refusal_mints_nothing(tmp_path: Path) -> None:
+    _seed_lease(tmp_path, "xenia", "receiver")
+    open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    pairs = [e for e in _rows(tmp_path) if {e["opened_by"], e["peer"]} == {"bob", "receiver"}]
+    assert pairs == []
+
+
+def test_claim_outbound_pair_merge_beats_busy(tmp_path: Path) -> None:
+    """Order mirrors inbound_gate — pair first. An opener continuing her
+    own thread is never self-busy, even while a third party holds a lease
+    on the same recipient."""
+    own = open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    assert own.action == "deliver" and own.created
+    _seed_lease(tmp_path, "xenia", "receiver")
+    out = open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    assert out.action == "deliver"
+    assert not out.created
+    assert out.entry["thread_id"] == own.entry["thread_id"]
+
+
+def test_claim_outbound_recipient_opened_lease_not_busy(tmp_path: Path) -> None:
+    """Claim-side mirror of A2b — the discriminator for the predicate's
+    direction. The recipient having OPENED a thread to someone else is
+    not busy (the §8.1 'in any thread' misreading refuses bob here); only
+    a third-party lease where peer == recipient refuses."""
+    _seed_lease(tmp_path, "receiver", "xenia")
+    out = open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    assert out.action == "deliver"
+    assert out.created
+
+
+def test_claim_outbound_expired_busy_row_does_not_refuse(tmp_path: Path) -> None:
+    _seed_lease(tmp_path, "xenia", "receiver", live=False)
+    out = open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
+    assert out.action == "deliver"
+    assert out.created
+
+
+def test_send_refuses_at_claim_without_wire(tmp_path: Path) -> None:
+    """E2E under a shared registry: send() surfaces the typed busy refusal
+    as DeliveryResult(error='busy', detail=...), spends zero wire, and
+    mints no claim."""
+    mesh = _mesh(tmp_path, name="sender")
+    _register_peer(mesh, "receiver", url="http://127.0.0.1:9/mesh/receive")
+    lease = _seed_lease(tmp_path, "xenia", "receiver")
+
+    sent: list = []
+    mesh.delivery.send = lambda *a, **k: sent.append(1) or DeliveryResult(delivery_id="x")  # type: ignore[method-assign]
+
+    r = mesh.send("receiver", "hello")
+    assert r.error == "busy"
+    assert r.detail["reason"] == "busy"
+    assert r.detail["thread_id"] == lease["thread_id"]
+    assert r.detail["reroute"]["retry_after"] == lease["lease_until"]
+    assert sent == []
+    pairs = [e for e in _rows(tmp_path) if {e["opened_by"], e["peer"]} == {"sender", "receiver"}]
+    assert pairs == []
+
+
 # --- A4 / A6: own retry after failure succeeds; slot free for others ---
 
 
