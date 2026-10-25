@@ -87,10 +87,10 @@ def test_thread_closed_rejection_does_not_poison_replay(tmp_path: Path) -> None:
         ref="closed-anchor-verify-1",
     )
 
-    with pytest.raises(ValueError, match="THREAD_CLOSED"):
+    with pytest.raises(ValueError, match="thread-closed"):
         mesh.verify_request(headers, body)
     # The retry must hit the same rejection, not a replay error.
-    with pytest.raises(ValueError, match="THREAD_CLOSED"):
+    with pytest.raises(ValueError, match="thread-closed"):
         mesh.verify_request(headers, body)
     assert not mesh.replay.has("closed-ref-msg-1")
 
@@ -117,7 +117,8 @@ def test_accepted_message_is_replay_protected(tmp_path: Path) -> None:
 
 
 def test_reply_end_records_close_after_seen(tmp_path: Path) -> None:
-    """A reply=end envelope is accepted, marked seen, and closes the thread."""
+    """A reply=end envelope is accepted, marked seen, and closes the thread
+    once the ingress commits it (post-enqueue — N8 receive side)."""
     mesh = _mesh(tmp_path)
     private, public = generate_keypair()
     _register_sender(mesh, "vesper", public)
@@ -131,7 +132,8 @@ def test_reply_end_records_close_after_seen(tmp_path: Path) -> None:
         reply="end",
     )
 
-    mesh.verify_request(headers, body)
+    env = mesh.verify_request(headers, body)
+    mesh.commit_terminator(env)
 
     from mesh_core.threads import is_closed
 
@@ -146,5 +148,5 @@ def test_reply_end_records_close_after_seen(tmp_path: Path) -> None:
         msg_id="after-close-1",
         ref="end-msg-1",
     )
-    with pytest.raises(ValueError, match="THREAD_CLOSED"):
+    with pytest.raises(ValueError, match="thread-closed"):
         mesh.verify_request(headers2, body2)

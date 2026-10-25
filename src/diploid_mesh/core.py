@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,14 @@ from mesh_core.registry import RegistryClient
 from mesh_core.threads import is_closed
 from mesh_core.threads import record as record_thread_close
 
+from diploid_mesh import open_threads
 from diploid_mesh.config import DiploidMeshConfig
+
+logger = logging.getLogger(__name__)
+
+# Delivery reasons that mean the recipient actively refused (everything
+# else maps to a transport-level failure for the N10 meter).
+_REFUSAL_REASONS = {"busy", "bad-request"}
 
 
 def _is_telegram_chat_id(chat_id: str | None) -> bool:
@@ -47,6 +55,22 @@ class ReplaySeenError(ValueError):
     def __init__(self, msg_id: str) -> None:
         super().__init__(f"Replay: message {msg_id} already seen")
         self.msg_id = msg_id
+
+
+class GateRefusal(ValueError):
+    """Typed thread-gate refusal (spec §4 N6).
+
+    Carries the refusal fields — ``reason``, ``thread_id``, ``peer``,
+    ``opened_at``, ``lease_until`` and the per-predicament reroute
+    address — for the ingress to return as the response body. Raised
+    before ``replay.add`` so a refused delivery's retry surfaces the same
+    refusal rather than degrading to a replay hit.
+    """
+
+    def __init__(self, detail: dict, *, status_code: int = 503) -> None:
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(f"gate-refused:{detail.get('reason', '?')}")
 
 
 class DiploidMesh:
@@ -197,7 +221,15 @@ class DiploidMesh:
         if self.replay.has(envelope.msg_id):
             raise ReplaySeenError(envelope.msg_id)
 
-        # Enforce THREAD_CLOSED for non-DSN messages.
+        if envelope.recipient != self.core_config.agent_name:
+            # A misaddressed POST must not mint foreign-pair leases.
+            raise ValueError(
+                f"misaddressed: to={envelope.recipient} is not {self.core_config.agent_name}"
+            )
+
+        # Enforce THREAD_CLOSED for non-DSN messages. The X-Mesh-DSN header
+        # is sender-controlled — a DSN bypasses the gate and the close path
+        # entirely (fine on a mutually-authenticated fleet; noted, not enforced).
         is_dsn = (headers.get("x-mesh-dsn") or headers.get("X-Mesh-DSN", "")).lower() in (
             "1",
             "true",
@@ -208,21 +240,70 @@ class DiploidMesh:
             and envelope.ref
             and is_closed(envelope.ref, vault_path=self.core_config.vault_path)
         ):
-            raise ValueError(f"THREAD_CLOSED: {envelope.ref}")
+            raise GateRefusal(
+                {
+                    "reason": "thread-closed",
+                    "anchor": envelope.ref,
+                    "peer": envelope.recipient,
+                    "reroute": {"action": "new-thread", "drop": "ref"},
+                },
+                status_code=400,
+            )
+
+        # Thread gate (N3, distributed shape): the whole decision — pair
+        # match, busy check, claim — is one locked operation here at
+        # ingress, before any wake is enqueued. A refusal costs the sender
+        # her send and us zero turns; a refused message is never marked
+        # seen, so its retry surfaces the same refusal.
+        gate_entry = None
+        if not is_dsn:
+            outcome = open_threads.inbound_gate(
+                sender=envelope.sender,
+                peer=envelope.recipient,
+                reply=envelope.reply,
+                vault_path=self.core_config.vault_path,
+            )
+            if outcome.action == "refuse":
+                raise GateRefusal(outcome.refusal or {})
+            gate_entry = outcome.entry
 
         # Mark seen only after all rejectable checks pass — a rejected
         # delivery must not poison the replay cache, or retries surface as
         # "Replay" instead of the real reason.
         self.replay.add(envelope.msg_id)
 
-        if not is_dsn and envelope.reply == "end":
-            record_thread_close(
-                envelope.msg_id,
-                self.core_config.agent_name,
-                vault_path=self.core_config.vault_path,
-            )
+        # N1 — surface the thread id where the recipient can read it.
+        # MeshEnvelope is a frozen dataclass; object.__setattr__ attaches a
+        # process-local attribute the ingress folds into the wake payload.
+        if gate_entry is not None:
+            object.__setattr__(envelope, "thread_id", gate_entry.get("thread_id"))
+        if not is_dsn and outcome.created:
+            object.__setattr__(envelope, "gate_created", True)
 
         return envelope
+
+    def commit_terminator(self, envelope: MeshEnvelope) -> None:
+        """Record a reply=end close and release the pair's lease.
+
+        Called by the ingress AFTER the wake is enqueued — a close must
+        never exist while the message carrying it has not actually been
+        handed onward (N8's property, applied to the receive side). If the
+        enqueue fails the sender's retry still lands.
+        """
+        if envelope.reply != "end":
+            return
+        record_thread_close(
+            envelope.msg_id,
+            self.core_config.agent_name,
+            vault_path=self.core_config.vault_path,
+        )
+        # A close for any message in a live pair releases that pair's
+        # lease (spec §10.2 — the pair is the identity, not the id).
+        open_threads.release_pair(
+            envelope.sender,
+            envelope.recipient,
+            vault_path=self.core_config.vault_path,
+        )
 
     def send(
         self,
@@ -253,17 +334,85 @@ class DiploidMesh:
             body=body,
         )
         target_url, allow_loopback = self._resolve_target(recipient)
-        if not target_url:
-            return DeliveryResult(error="not-found")
+
+        # Thread gate, send side: claim the pair locally so inbound replies
+        # match it as thread traffic (an opener is never busy). Notices and
+        # terminators make no claim. A claim minted by THIS send is released
+        # when the transport gives up (N4) — a merged row predates the send
+        # and stays.
+        claim_entry = None
+        claim_created = False
+        if target_url and reply not in ("no", "end"):
+            claim_entry, claim_created = open_threads.claim_outbound(
+                me=self.core_config.agent_name,
+                peer=recipient,
+                vault_path=self.core_config.vault_path,
+            )
+        elif not target_url:
+            result = DeliveryResult(error="not-found")
+            self._meter(agent=recipient, action=action, reply=reply, outcome="failed")
+            return result
 
         # Allow per-peer loopback override.
-        return self.delivery.send(
+        result = self.delivery.send(
             envelope,
             target_url,
             dsn_from=self.core_config.agent_name,
             dsn_to=recipient,
             is_dsn=False,
             allow_loopback=allow_loopback or self.core_config.allow_loopback,
+        )
+
+        outcome = (
+            "delivered"
+            if not result.error
+            else ("refused" if result.error in _REFUSAL_REASONS else "failed")
+        )
+        self._meter(
+            agent=recipient,
+            action=action,
+            reply=reply,
+            thread=(claim_entry or {}).get("thread_id"),
+            outcome=outcome,
+        )
+
+        if result.error:
+            if claim_created:
+                open_threads.release_pair(
+                    self.core_config.agent_name,
+                    recipient,
+                    vault_path=self.core_config.vault_path,
+                )
+            return result
+
+        if reply == "end":
+            # Never-materialize N8: nothing was written before confirmed
+            # delivery; on success the close lands and the pair's lease is
+            # released.
+            record_thread_close(
+                envelope.msg_id,
+                self.core_config.agent_name,
+                vault_path=self.core_config.vault_path,
+            )
+            open_threads.release_pair(
+                self.core_config.agent_name,
+                recipient,
+                vault_path=self.core_config.vault_path,
+            )
+        return result
+
+    @staticmethod
+    def _meter(
+        *, agent: str, action: str, reply: str, thread: str | None = None, outcome: str
+    ) -> None:
+        """N10 — one line per send attempt, all five fields."""
+        logger.info(
+            "[mesh] send agent=%s action=%s reply=%s thread=%s outcome=%s",
+            agent,
+            action,
+            reply,
+            thread or "-",
+            outcome,
         )
 
     def list_peers(self) -> list[MeshIdentity]:
