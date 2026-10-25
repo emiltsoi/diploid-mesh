@@ -17,6 +17,7 @@ from diploid_agent.config import (
 from diploid_agent.plugins.base import StatePlugin, TurnInfo, WakeContext
 from diploid_agent.plugins.contexts import PromptBuildContext, PromptContext
 
+from diploid_mesh._paths import safe_dir_name
 from diploid_mesh.config import DiploidMeshConfig
 from diploid_mesh.prompt import mesh_prompt_block
 
@@ -51,7 +52,7 @@ class DiploidMeshPlugin(StatePlugin):
         return self._chat_dir() / self.config.state_file
 
     def _chat_dir(self) -> Path:
-        return self.sessions_root / self.chat_id.replace("/", "_")
+        return self.sessions_root / safe_dir_name(self.chat_id)
 
     def _load_state(self) -> dict[str, Any]:
         path = self.state_path()
@@ -85,6 +86,9 @@ class DiploidMeshPlugin(StatePlugin):
             env.append(f"MESH_VAULT_PATH={mesh.vault_path}")
         if mesh.registry_url:
             env.append(f"MESH_REGISTRY_URL={mesh.registry_url}")
+        if mesh.allow_insecure_registry:
+            # mesh_core's RegistryClient also honours this env directly.
+            env.append("MESH_REGISTRY_ALLOW_INSECURE=1")
         if mesh.private_key_path:
             env.append(f"MESH_PRIVATE_KEY_PATH={mesh.private_key_path}")
         if mesh.allow_loopback:

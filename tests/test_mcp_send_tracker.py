@@ -20,7 +20,7 @@ def _tracker(
     return MeshSendTracker(
         "mesh:test",
         harness_url,
-        state_path or Path("/tmp/fake_mesh_state.json"),
+        state_path or Path("fake_mesh_state.json"),
         None,
         max_sends,
         suggestion,
@@ -28,8 +28,8 @@ def _tracker(
 
 
 @respx.mock
-def test_tracker_allows_until_cap_and_nudges() -> None:
-    state = Path("/tmp/test_mesh_state_yes.json")
+def test_tracker_allows_until_cap_and_nudges(tmp_path: Path) -> None:
+    state = tmp_path / "test_mesh_state_yes.json"
     state.write_text(json.dumps({"current_mesh": {"reply": "yes"}}))
     route = respx.get("http://127.0.0.1:4003/turn/mesh:test").mock(
         return_value=Response(
@@ -62,11 +62,11 @@ def test_tracker_allows_until_cap_and_nudges() -> None:
 
 
 @respx.mock
-def test_tracker_allows_send_on_reply_end_turn() -> None:
+def test_tracker_allows_send_on_reply_end_turn(tmp_path: Path) -> None:
     """A turn woken by reply=end may still send — the contract allows a new
     thread with a fresh ref; closed-thread refs are rejected downstream as
     THREAD_CLOSED, not gated here on the inbound flag."""
-    state = Path("/tmp/test_mesh_state_end.json")
+    state = tmp_path / "test_mesh_state_end.json"
     state.write_text(json.dumps({"current_mesh": {"reply": "end"}}))
     route = respx.get("http://127.0.0.1:4003/turn/mesh:test").mock(
         return_value=Response(
