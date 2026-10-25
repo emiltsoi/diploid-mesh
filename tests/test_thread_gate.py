@@ -197,10 +197,15 @@ def test_claim_outbound_refuses_when_recipient_busy(tmp_path: Path) -> None:
 
 
 def test_claim_outbound_refusal_mints_nothing(tmp_path: Path) -> None:
-    _seed_lease(tmp_path, "xenia", "receiver")
+    lease = _seed_lease(tmp_path, "xenia", "receiver")
     open_threads.claim_outbound(me="bob", peer="receiver", vault_path=tmp_path / "vault")
     pairs = [e for e in _rows(tmp_path) if {e["opened_by"], e["peer"]} == {"bob", "receiver"}]
     assert pairs == []
+    # The refusal must not touch the blocking row either — a claim-time
+    # refresh would silently extend xenia's hold.
+    blocking = next(e for e in _rows(tmp_path) if e["thread_id"] == lease["thread_id"])
+    assert blocking["lease_until"] == lease["lease_until"]
+    assert blocking["replies"] == 0
 
 
 def test_claim_outbound_pair_merge_beats_busy(tmp_path: Path) -> None:
