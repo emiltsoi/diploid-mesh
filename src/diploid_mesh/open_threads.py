@@ -19,6 +19,7 @@ Expired rows are never swept (spec §6); liveness is computed at read.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -34,6 +35,11 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - POSIX-only feature
     fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Windows-only feature
+    msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,34 @@ def _registry_path(vault_path: str | Path | None = None) -> Path:
     return root / "mesh" / _DEFAULT_NAME
 
 
+_LOCK_ACQUIRE_DEADLINE_S = 60.0
+
+
+_RETRYABLE_LOCK_ERRNOS = (errno.EACCES, errno.EDEADLK)
+
+
+def _lock_fd_windows(fd: int) -> None:
+    """Blocking byte-range lock via msvcrt. LK_NBLCK fails immediately on
+    contention — own sleep loop so the deadline is precise (LK_LOCK burns
+    ~10s internally per attempt) and only EACCES/EDEADLK retry; any other
+    OSError fails fast like flock would."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    deadline = time.monotonic() + _LOCK_ACQUIRE_DEADLINE_S
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno not in _RETRYABLE_LOCK_ERRNOS or time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _unlock_fd_windows(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 @contextmanager
 def _registry_lock(path: Path):
     lock_path = Path(f"{path}.lock")
@@ -63,10 +97,17 @@ def _registry_lock(path: Path):
         try:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                _lock_fd_windows(fd)
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                try:
+                    _unlock_fd_windows(fd)
+                except OSError:
+                    pass
             os.close(fd)
 
 
