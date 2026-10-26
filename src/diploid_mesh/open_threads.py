@@ -19,6 +19,7 @@ Expired rows are never swept (spec §6); liveness is computed at read.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -62,18 +63,22 @@ def _registry_path(vault_path: str | Path | None = None) -> Path:
 _LOCK_ACQUIRE_DEADLINE_S = 60.0
 
 
+_RETRYABLE_LOCK_ERRNOS = (errno.EACCES, errno.EDEADLK)
+
+
 def _lock_fd_windows(fd: int) -> None:
-    """Blocking byte-range lock via msvcrt. LK_LOCK gives up after ~10s, so
-    retry until the deadline — flock(LOCK_EX) waits indefinitely and the
-    decision point must not silently proceed unlocked."""
+    """Blocking byte-range lock via msvcrt. LK_NBLCK fails immediately on
+    contention — own sleep loop so the deadline is precise (LK_LOCK burns
+    ~10s internally per attempt) and only EACCES/EDEADLK retry; any other
+    OSError fails fast like flock would."""
     os.lseek(fd, 0, os.SEEK_SET)
     deadline = time.monotonic() + _LOCK_ACQUIRE_DEADLINE_S
     while True:
         try:
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             return
-        except OSError:
-            if time.monotonic() > deadline:
+        except OSError as exc:
+            if exc.errno not in _RETRYABLE_LOCK_ERRNOS or time.monotonic() > deadline:
                 raise
             time.sleep(0.05)
 
