@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import logging
 import time
@@ -106,6 +107,39 @@ class DiploidMesh:
                 self.public_key,
                 allow_insecure=self.core_config.allow_insecure_registry,
                 pin=self.core_config.registry_pin,
+            )
+        self._warn_lan_peers_without_allow()
+
+    def _warn_lan_peers_without_allow(self) -> None:
+        """Warn once when LAN peers exist that the SSRF guard will refuse.
+
+        ``allow_loopback`` lives in mutable config/env, so it can quietly
+        revert (a stale runtime-overrides snapshot did exactly that and every
+        send died loopback-blocked with no packet on the wire). The flag's
+        absence must be loud: if any vault peer is LAN-addressed and neither
+        the global flag nor its per-peer flag admits it, say so at startup.
+        Literal-IP hosts only — no DNS in a warning path.
+        """
+        if self.core_config.allow_loopback:
+            return
+        blocked: list[str] = []
+        for identity in self.vault.list():
+            if identity.allow_loopback:
+                continue
+            host = urlparse(identity.url or "").hostname or ""
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            if ip.is_loopback or ip.is_private or ip.is_link_local:
+                blocked.append(identity.name)
+        if blocked:
+            logger.warning(
+                "[diploid-mesh] %d vault peer(s) are LAN-addressed but unreachable: "
+                "allow_loopback is unset globally and on their identities (%s) — "
+                "sends will be refused loopback-blocked",
+                len(blocked),
+                ", ".join(sorted(blocked)),
             )
 
     def is_known(self, name: str) -> bool:
