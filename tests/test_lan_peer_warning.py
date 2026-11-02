@@ -38,9 +38,7 @@ def _mesh(tmp_path: Path, *, allow_loopback: bool = False) -> DiploidMesh:
     return DiploidMesh(DiploidMeshConfig(cfg))
 
 
-def test_warns_for_lan_peer_without_allow(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_warns_for_lan_peer_without_allow(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _seed_peer(tmp_path / "vault", "lily", "http://192.168.1.48:8760/mesh/receive")
     with caplog.at_level(logging.WARNING, logger="diploid_mesh.core"):
         _mesh(tmp_path)
@@ -48,18 +46,14 @@ def test_warns_for_lan_peer_without_allow(
     assert "lily" in caplog.text
 
 
-def test_silent_when_global_allow(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_silent_when_global_allow(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _seed_peer(tmp_path / "vault", "lily", "http://192.168.1.48:8760/mesh/receive")
     with caplog.at_level(logging.WARNING, logger="diploid_mesh.core"):
         _mesh(tmp_path, allow_loopback=True)
     assert "LAN-addressed" not in caplog.text
 
 
-def test_silent_when_peer_flag_set(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_silent_when_peer_flag_set(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _seed_peer(
         tmp_path / "vault",
         "lily",
@@ -71,9 +65,7 @@ def test_silent_when_peer_flag_set(
     assert "LAN-addressed" not in caplog.text
 
 
-def test_silent_for_wan_peer(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_silent_for_wan_peer(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _seed_peer(tmp_path / "vault", "remote", "https://8.8.8.8/mesh/receive")
     with caplog.at_level(logging.WARNING, logger="diploid_mesh.core"):
         _mesh(tmp_path)
