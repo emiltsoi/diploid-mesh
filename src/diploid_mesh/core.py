@@ -1,0 +1,741 @@
+"""Core DiploidMesh class that wires mesh_core to a diploid-agent runtime."""
+
+from __future__ import annotations
+
+import copy
+import ipaddress
+import json
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from mesh_core import (
+    DeliveryClient,
+    DeliveryResult,
+    IdentityVault,
+    MeshEnvelope,
+    MeshIdentity,
+    ReplayWindow,
+    load_or_generate_keypair,
+    parse_envelope,
+    verify_message,
+)
+from mesh_core.registry import RegistryClient
+from mesh_core.threads import is_closed
+from mesh_core.threads import record as record_thread_close
+
+from diploid_mesh import open_threads
+from diploid_mesh.config import DiploidMeshConfig
+
+logger = logging.getLogger(__name__)
+
+# Delivery reasons that mean the recipient actively refused (everything
+# else maps to a transport-level failure for the N10 meter).
+_REFUSAL_REASONS = {"busy", "bad-request"}
+
+
+@dataclass
+class MeshSendResult(DeliveryResult):
+    """Delivery result plus journal/thread provenance observed by the send path."""
+
+    journal_delivery_state: str | None = None
+    claim_thread_id: str | None = None
+
+
+def _is_telegram_chat_id(chat_id: str | None) -> bool:
+    """Return True if chat_id looks like a Telegram numeric chat id."""
+    if not chat_id:
+        return False
+    return chat_id.lstrip("-").isdigit()
+
+
+class ReplaySeenError(ValueError):
+    """Envelope msg_id was already accepted.
+
+    Raised by ``verify_request`` when the replay window has seen the id.
+    ``replay.add`` runs only after every rejectable check passes, so an
+    "already seen" hit is proof of prior acceptance — the ingress maps it
+    to an idempotent ``202 {"status": "duplicate"}`` rather than a 400,
+    which makes a response-lost retry report delivered instead of failed.
+    """
+
+    def __init__(self, msg_id: str) -> None:
+        super().__init__(f"Replay: message {msg_id} already seen")
+        self.msg_id = msg_id
+
+
+class GateRefusal(ValueError):
+    """Typed thread-gate refusal (spec §4 N6).
+
+    Carries the refusal fields — ``reason``, ``thread_id``, ``peer``,
+    ``opened_at``, ``lease_until`` and the per-predicament reroute
+    address — for the ingress to return as the response body. Raised
+    before ``replay.add`` so a refused delivery's retry surfaces the same
+    refusal rather than degrading to a replay hit.
+    """
+
+    def __init__(self, detail: dict, *, status_code: int = 503) -> None:
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(f"gate-refused:{detail.get('reason', '?')}")
+
+
+class DiploidMesh:
+    """Runtime handle for a diploid-agent mesh peer."""
+
+    def __init__(self, config: DiploidMeshConfig) -> None:
+        self.config = config
+        self.core_config = config.to_mesh_core()
+        self.vault = IdentityVault(root=self.core_config.vault_path)
+        self.private_key, self.public_key = load_or_generate_keypair(
+            self.core_config.agent_name,
+            private_key_path_override=self.core_config.private_key_path,
+        )
+        self.delivery = DeliveryClient(
+            private_key_pem=self.private_key,
+            sign_timestamp=self.core_config.sign_timestamp,
+            allow_loopback=self.core_config.allow_loopback,
+            retries=self.core_config.delivery_retries,
+            backoff=self.core_config.delivery_backoff,
+            timeout=self.core_config.delivery_timeout,
+            dsn_enabled=self.core_config.dsn_enabled,
+            agent_name=self.core_config.agent_name,
+        )
+        self.replay = ReplayWindow(
+            ttl=self.core_config.replay_window_ttl,
+            max_size=self.core_config.replay_window_size,
+        )
+        self.registry: RegistryClient | None = None
+        if self.core_config.registry_url:
+            self.registry = RegistryClient(
+                self.core_config.registry_url,
+                self.private_key,
+                self.public_key,
+                allow_insecure=self.core_config.allow_insecure_registry,
+                pin=self.core_config.registry_pin,
+            )
+        self._warn_lan_peers_without_allow()
+
+    def _warn_lan_peers_without_allow(self) -> None:
+        """Warn once when LAN peers exist that the SSRF guard will refuse.
+
+        ``allow_loopback`` lives in mutable config/env, so it can quietly
+        revert (a stale runtime-overrides snapshot did exactly that and every
+        send died loopback-blocked with no packet on the wire). The flag's
+        absence must be loud: if any vault peer is LAN-addressed and neither
+        the global flag nor its per-peer flag admits it, say so at startup.
+        Literal-IP hosts only — no DNS in a warning path.
+        """
+        if self.core_config.allow_loopback:
+            return
+        blocked: list[str] = []
+        for identity in self.vault.list():
+            if identity.allow_loopback:
+                continue
+            host = urlparse(identity.url or "").hostname or ""
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            if ip.is_loopback or ip.is_private or ip.is_link_local:
+                blocked.append(identity.name)
+        if blocked:
+            logger.warning(
+                "[diploid-mesh] %d vault peer(s) are LAN-addressed but unreachable: "
+                "allow_loopback is unset globally and on their identities (%s) — "
+                "sends will be refused loopback-blocked",
+                len(blocked),
+                ", ".join(sorted(blocked)),
+            )
+
+    def is_known(self, name: str) -> bool:
+        """Return True if the named peer is known locally or via registry."""
+        if self.vault.get(name):
+            return True
+        if self.registry:
+            try:
+                peer = self.registry.get_peer(name)
+            except Exception:  # noqa
+                peer = None
+            if peer:
+                return True
+        return False
+
+    def resolve_chat_id(self, sender: str, session: str | None = None) -> str:
+        """Map an inbound sender/session to a diploid chat_id.
+
+        - chat_mapping == "single" -> always fallback_chat_id.
+        - chat_mapping == "per_sender" -> chat_map keyed by sender, then
+          fallback_chat_id (or a mesh:<sender> chat if the fallback is not a
+          real Telegram chat id).
+        - chat_mapping == "session" -> chat_map keyed by session name,
+          falling back to sender lookup, then fallback_chat_id (or a
+          mesh:<sender> chat if the fallback is not a real Telegram chat id).
+
+        When the fallback_chat_id is a real Telegram chat id, unmapped messages
+        from known peers are routed there instead of creating phantom
+        ``mesh:<sender>`` sessions.
+        """
+        cfg = self.config.config
+        if cfg.chat_mapping == "single":
+            return cfg.fallback_chat_id
+
+        if cfg.chat_mapping == "session" and session and session in cfg.chat_map:
+            return cfg.chat_map[session]
+
+        if sender in cfg.chat_map:
+            return cfg.chat_map[sender]
+
+        # Default unmapped known peers to the configured fallback chat when it
+        # is a real Telegram session. This prevents every new mesh peer from
+        # spawning a phantom `mesh:<sender>` chat on diploid-agent instances.
+        if _is_telegram_chat_id(cfg.fallback_chat_id):
+            return cfg.fallback_chat_id
+
+        if self.is_known(sender):
+            return f"mesh:{sender}"
+
+        return cfg.fallback_chat_id
+
+    def _resolve_target(self, recipient: str) -> tuple[str | None, bool]:
+        """Return (target_url, allow_loopback) for a recipient."""
+        identity = self.vault.get(recipient)
+        if identity and identity.url:
+            return identity.url, bool(identity.allow_loopback)
+        if self.registry:
+            try:
+                peer = self.registry.get_peer(recipient)
+            except Exception:  # noqa
+                peer = None
+            if peer:
+                return peer.get("url"), peer.get("allow_loopback", False)
+        return None, False
+
+    def _sender_public_key(self, sender: str) -> str | None:
+        identity = self.vault.get(sender)
+        if identity and identity.public_key:
+            return identity.public_key
+        if self.registry:
+            try:
+                peer = self.registry.get_peer(sender)
+            except Exception:  # noqa
+                peer = None
+            if peer:
+                return peer.get("public_key")
+        return None
+
+    def verify_request(self, headers: dict, body: bytes) -> MeshEnvelope:
+        """Verify a mesh webhook request and return the parsed envelope.
+
+        Raises ValueError for missing/invalid signature, timestamp, or envelope.
+        """
+        signature = headers.get("x-mesh-signature") or headers.get("X-Mesh-Signature", "")
+        timestamp = headers.get("x-mesh-timestamp") or headers.get("X-Mesh-Timestamp", "")
+        if not signature or not timestamp:
+            raise ValueError("Missing X-Mesh-Signature or X-Mesh-Timestamp")
+
+        try:
+            ts = float(timestamp)
+        except ValueError as exc:
+            raise ValueError("Invalid X-Mesh-Timestamp") from exc
+        if abs(time.time() - ts) > 300:
+            raise ValueError("X-Mesh-Timestamp outside replay window")
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("Invalid JSON body") from exc
+
+        text = payload.get("text", "")
+        sender = payload.get("from", "unknown")
+        envelope = parse_envelope(text)
+
+        public_key = self._sender_public_key(sender)
+        if not public_key:
+            raise ValueError(f"No public key for sender {sender}")
+
+        signed_body = f"{timestamp}\n{body.decode('utf-8')}".encode()
+        if not verify_message(public_key, signed_body, signature):
+            raise ValueError("Ed25519 signature verification failed")
+
+        if self.replay.has(envelope.msg_id):
+            raise ReplaySeenError(envelope.msg_id)
+
+        if envelope.recipient != self.core_config.agent_name:
+            # A misaddressed POST must not mint foreign-pair leases.
+            raise ValueError(
+                f"misaddressed: to={envelope.recipient} is not {self.core_config.agent_name}"
+            )
+
+        # Enforce THREAD_CLOSED for non-DSN messages. The X-Mesh-DSN header
+        # is sender-controlled — a DSN bypasses the gate and the close path
+        # entirely (fine on a mutually-authenticated fleet; noted, not enforced).
+        is_dsn = (headers.get("x-mesh-dsn") or headers.get("X-Mesh-DSN", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if (
+            not is_dsn
+            and envelope.ref
+            and is_closed(envelope.ref, vault_path=self.core_config.vault_path)
+        ):
+            raise GateRefusal(
+                {
+                    "reason": "thread-closed",
+                    "anchor": envelope.ref,
+                    "peer": envelope.recipient,
+                    "reroute": {"action": "new-thread", "drop": "ref"},
+                },
+                status_code=400,
+            )
+
+        # Thread gate (N3, distributed shape): the whole decision — pair
+        # match, busy check, claim — is one locked operation here at
+        # ingress, before any wake is enqueued. A refusal costs the sender
+        # her send and us zero turns; a refused message is never marked
+        # seen, so its retry surfaces the same refusal.
+        gate_entry = None
+        if not is_dsn:
+            outcome = open_threads.inbound_gate(
+                sender=envelope.sender,
+                peer=envelope.recipient,
+                reply=envelope.reply,
+                vault_path=self.core_config.vault_path,
+            )
+            if outcome.action == "refuse":
+                raise GateRefusal(outcome.refusal or {})
+            gate_entry = outcome.entry
+
+        # Mark seen only after all rejectable checks pass — a rejected
+        # delivery must not poison the replay cache, or retries surface as
+        # "Replay" instead of the real reason.
+        self.replay.add(envelope.msg_id)
+
+        # N1 — surface the thread id where the recipient can read it.
+        # MeshEnvelope is a frozen dataclass; object.__setattr__ attaches a
+        # process-local attribute the ingress folds into the wake payload.
+        if gate_entry is not None:
+            object.__setattr__(envelope, "thread_id", gate_entry.get("thread_id"))
+        if not is_dsn and outcome.created:
+            object.__setattr__(envelope, "gate_created", True)
+
+        return envelope
+
+    def commit_terminator(self, envelope: MeshEnvelope) -> None:
+        """Record a reply=end close and release the pair's lease.
+
+        Called by the ingress AFTER the wake is enqueued — a close must
+        never exist while the message carrying it has not actually been
+        handed onward (N8's property, applied to the receive side). If the
+        enqueue fails the sender's retry still lands.
+        """
+        if envelope.reply != "end":
+            return
+        record_thread_close(
+            envelope.msg_id,
+            self.core_config.agent_name,
+            vault_path=self.core_config.vault_path,
+        )
+        # A close for any message in a live pair releases that pair's
+        # lease (spec §10.2 — the pair is the identity, not the id).
+        open_threads.release_pair(
+            envelope.sender,
+            envelope.recipient,
+            vault_path=self.core_config.vault_path,
+        )
+
+    def send(
+        self,
+        recipient: str,
+        body: str,
+        *,
+        action: str = "do",
+        reply: str = "yes",
+        ref: str | None = None,
+        msg_id: str | None = None,
+        session: str | None = None,
+        from_session: str | None = None,
+    ) -> MeshSendResult:
+        """Send a mesh message to `recipient`."""
+        import uuid
+
+        if msg_id is None:
+            msg_id = str(uuid.uuid4())
+        envelope = MeshEnvelope(
+            sender=self.core_config.agent_name,
+            recipient=recipient,
+            msg_id=msg_id,
+            action=action,  # type: ignore[arg-type]
+            reply=reply,  # type: ignore[arg-type]
+            ref=ref,
+            session=session,
+            from_session=from_session,
+            body=body,
+        )
+        target_url, allow_loopback = self._resolve_target(recipient)
+
+        # Thread gate, send side: claim the pair locally so inbound replies
+        # match it as thread traffic (an opener is never busy). Notices and
+        # terminators make no claim. A claim minted by THIS send is released
+        # when the transport gives up (N4) — a merged row predates the send
+        # and stays.
+        claim_entry = None
+        claim_created = False
+        if target_url and reply not in ("no", "end"):
+            claim = open_threads.claim_outbound(
+                me=self.core_config.agent_name,
+                peer=recipient,
+                vault_path=self.core_config.vault_path,
+            )
+            if claim.action == "refuse":
+                # Shared-registry deployments contest the pair at claim
+                # time (§11): the recipient holds a live lease opened by a
+                # third party, so the send never reaches the wire. The
+                # typed refusal body is identical to the wire refusal.
+                refusal = claim.refusal or {}
+                result = MeshSendResult(
+                    error="busy",
+                    detail=refusal,
+                    journal_delivery_state="outbound-local-refused",
+                )
+                self._meter(
+                    agent=recipient,
+                    action=action,
+                    reply=reply,
+                    thread=refusal.get("thread_id"),
+                    outcome="refused",
+                )
+                return result
+            claim_entry = claim.entry
+            claim_created = claim.created
+        elif target_url:
+            # Notices and terminators make no claim, but a live pair row is
+            # still write-time correlation evidence when one exists.
+            claim_entry = open_threads.live_pair(
+                self.core_config.agent_name,
+                recipient,
+                vault_path=self.core_config.vault_path,
+            )
+        elif not target_url:
+            pair = open_threads.live_pair(
+                self.core_config.agent_name,
+                recipient,
+                vault_path=self.core_config.vault_path,
+            )
+            result = MeshSendResult(
+                error="not-found",
+                journal_delivery_state="outbound-send-failed",
+                claim_thread_id=(pair or {}).get("thread_id"),
+            )
+            self._meter(agent=recipient, action=action, reply=reply, outcome="failed")
+            return result
+
+        # Allow per-peer loopback override.
+        transport_result = self.delivery.send(
+            envelope,
+            target_url,
+            dsn_from=self.core_config.agent_name,
+            dsn_to=recipient,
+            is_dsn=False,
+            allow_loopback=allow_loopback or self.core_config.allow_loopback,
+        )
+
+        outcome = (
+            "delivered"
+            if not transport_result.error
+            else ("refused" if transport_result.error in _REFUSAL_REASONS else "failed")
+        )
+        journal_delivery_state = (
+            "outbound-recipient-accepted"
+            if not transport_result.error
+            else (
+                "outbound-recipient-refused"
+                if transport_result.error in _REFUSAL_REASONS
+                else "outbound-send-failed"
+            )
+        )
+        result = MeshSendResult(
+            delivery_id=transport_result.delivery_id,
+            error=transport_result.error,
+            detail=transport_result.detail,
+            journal_delivery_state=journal_delivery_state,
+            claim_thread_id=(claim_entry or {}).get("thread_id"),
+        )
+        self._meter(
+            agent=recipient,
+            action=action,
+            reply=reply,
+            thread=(claim_entry or {}).get("thread_id"),
+            outcome=outcome,
+        )
+
+        if result.error:
+            if claim_created:
+                open_threads.release_pair(
+                    self.core_config.agent_name,
+                    recipient,
+                    vault_path=self.core_config.vault_path,
+                )
+            return result
+
+        if reply == "end":
+            # Never-materialize N8: nothing was written before confirmed
+            # delivery; on success the close lands and the pair's lease is
+            # released.
+            record_thread_close(
+                envelope.msg_id,
+                self.core_config.agent_name,
+                vault_path=self.core_config.vault_path,
+            )
+            open_threads.release_pair(
+                self.core_config.agent_name,
+                recipient,
+                vault_path=self.core_config.vault_path,
+            )
+        return result
+
+    @staticmethod
+    def _meter(
+        *, agent: str, action: str, reply: str, thread: str | None = None, outcome: str
+    ) -> None:
+        """N10 — one line per send attempt, all five fields."""
+        logger.info(
+            "[mesh] send agent=%s action=%s reply=%s thread=%s outcome=%s",
+            agent,
+            action,
+            reply,
+            thread or "-",
+            outcome,
+        )
+
+    def list_peers(self) -> list[MeshIdentity]:
+        """List mesh peers from the local vault."""
+        return self.vault.list()
+
+    def register(
+        self,
+        name: str,
+        url: str | None = None,
+        role: str = "agent",
+        description: str = "",
+        ttl: int | None = None,
+    ) -> dict:
+        """Register this or another peer with the mesh-peer-registry."""
+        if not self.registry:
+            return {"ok": False, "error": "registry_url not configured"}
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        return self.registry.register(name, url, role, description, ttl)
+
+    def deregister(self, name: str) -> dict:
+        if not self.registry:
+            return {"ok": False, "error": "registry_url not configured"}
+        return self.registry.deregister(name)
+
+    def sync(self, name: str | None = None) -> dict:
+        return self.sync_to_vault(name)
+
+    def publish(
+        self,
+        name: str | None = None,
+        url: str | None = None,
+        role: str = "agent",
+        description: str = "",
+        ttl: int | None = None,
+    ) -> dict:
+        """Publish this agent's own identity to the registry."""
+        name = name or self.core_config.agent_name
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        return self.register(name, url, role, description, ttl)
+
+    def _default_receive_url(self) -> str:
+        """Return this agent's canonical mesh receive URL.
+
+        Priority:
+        1. The configured harness_url + /mesh/receive.
+        2. The URL stored in this agent's own vault identity.
+
+        If neither is available, fail loudly. Never fall back to a guessed
+        hostname/port, because publishing a bad URL to the registry will break
+        peer discovery.
+        """
+        if self.config.harness_url:
+            return f"{self.config.harness_url.rstrip('/')}/mesh/receive"
+        own = self.vault.get(self.core_config.agent_name)
+        if own and own.url:
+            return own.url
+        raise RuntimeError(
+            "Cannot determine mesh receive URL: set harness_url or register "
+            "an identity with a URL before publishing."
+        )
+
+    def _harness_port_from_url(self, url: str) -> int:
+        parsed = urlparse(url)
+        return parsed.port or 80
+
+    def register_local(
+        self,
+        name: str | None = None,
+        url: str | None = None,
+        role: str = "agent",
+        description: str = "",
+        platform: str = "diploid",
+    ) -> dict:
+        """Write this agent's identity to the local mesh vault."""
+        name = name or self.core_config.agent_name
+        if not name:
+            return {"ok": False, "error": "agent name not configured"}
+        try:
+            url = url or self._default_receive_url()
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not url:
+            return {"ok": False, "error": "receive URL not configured"}
+
+        identity = MeshIdentity(
+            id=name,
+            name=name,
+            role=role,
+            description=description or f"Diploid agent substrate — {name.title()}",
+            url=url,
+            a2a_url="",
+            public_key=self.public_key,
+            allow_loopback=self.core_config.allow_loopback,
+            platform=platform,
+        )
+        path = self.vault.save(name, identity)
+
+        # Re-read and add diploid-specific markers that mesh_core ignores but
+        # other tooling can use.
+        raw = self.vault._load_yaml(path) or {}
+        raw["kind"] = "diploid-agent"
+        raw["platform"] = platform
+        raw.setdefault("mesh", {})
+        raw["mesh"]["port"] = self._harness_port_from_url(url)
+        raw["mesh"]["registry_url"] = self.core_config.registry_url or ""
+        raw["mesh"]["allow_loopback"] = self.core_config.allow_loopback
+        self.vault._save_yaml(path, raw)
+
+        return {
+            "ok": True,
+            "name": name,
+            "path": str(path),
+            "url": url,
+            "description": identity.description,
+        }
+
+    def join_mesh(self) -> dict:
+        """Join the family mesh: local identity, publish, sync peers."""
+        local = self.register_local()
+        if not local.get("ok"):
+            return local
+        published = self.publish(
+            role=local.get("role", "agent"),
+            description=local.get("description", ""),
+        )
+        synced = self.sync_to_vault()
+        return {
+            "ok": True,
+            "registered": local,
+            "published": published,
+            "synced": synced,
+        }
+
+    def sync_to_vault(self, name: str | None = None) -> dict:
+        """Fetch peer(s) from the registry and persist them in the local vault.
+
+        New peers are saved with the registry's public_key and inferred platform.
+        Existing identity files are only updated for discovery fields
+        (url, role, description). Their public_key and platform are preserved,
+        because the local fleet vault is the canonical source of truth for keys
+        and substrate tags; the registry is only authoritative for discovery.
+        """
+        if not self.registry:
+            return {"ok": False, "error": "registry_url not configured"}
+
+        peers: list[Any]
+        if name:
+            peer = self.registry.get_peer(name)
+            peers = [peer] if peer else []
+        else:
+            peers = self.registry.list_peers()
+
+        saved: list[str] = []
+        updated: list[str] = []
+        failed: list[dict] = []
+        for peer in peers:
+            try:
+                identity = MeshIdentity(
+                    id=peer.name,
+                    name=peer.name,
+                    role=peer.role or "agent",
+                    description=peer.description or "",
+                    url=peer.url,
+                    a2a_url="",
+                    public_key=peer.public_key,
+                    allow_loopback=bool(getattr(peer, "allow_loopback", False)),
+                    platform=self._infer_peer_platform(peer),
+                )
+                path = self.vault._identity_file(peer.name)
+                if path.exists():
+                    self._merge_identity(path, identity)
+                    updated.append(peer.name)
+                else:
+                    self.vault.save(peer.name, identity)
+                    saved.append(peer.name)
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"name": peer.name, "error": str(exc)})
+
+        return {
+            "ok": True,
+            "saved": saved,
+            "updated": updated,
+            "failed": failed,
+            "total": len(peers),
+        }
+
+    def _merge_identity(self, path: Path, identity: MeshIdentity) -> None:
+        """Update an existing identity.yaml while preserving public_key and platform.
+
+        The local fleet vault is the canonical source of truth for an agent's
+        public key and its substrate tag. The registry is only authoritative for
+        discovery metadata (url, role, description), so those are updated but
+        keys and platform are left untouched.
+        """
+        raw = self.vault._load_yaml(path) or {}
+        original = copy.deepcopy(raw)
+        raw["id"] = identity.id or identity.name
+        raw["name"] = identity.name
+        raw["role"] = identity.role
+        raw["description"] = identity.description
+        if identity.allow_loopback:
+            raw["allow_loopback"] = True
+        if not raw.get("platform") and identity.platform:
+            raw["platform"] = identity.platform
+        transports = raw.setdefault("transports", {})
+        hermes = transports.setdefault("hermes_webhook", {})
+        hermes["url"] = identity.url
+        existing_auth = hermes.get("auth", {}) or {}
+        if not existing_auth.get("public_key") and identity.public_key:
+            hermes["auth"] = {"public_key": identity.public_key}
+        if raw != original:
+            self.vault._save_yaml(path, raw)
+        self.vault._cache.pop(path, None)
+
+    def _infer_peer_platform(self, peer: Any) -> str:
+        """Guess the peer's substrate from its metadata or URL."""
+        if getattr(peer, "platform", None):
+            return peer.platform
+        url = (getattr(peer, "url", "") or "").lower()
+        if "/plugins/openclaw-mesh" in url or "openclaw" in url:
+            return "openclaw"
+        return "hermes"
