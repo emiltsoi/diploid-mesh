@@ -165,6 +165,19 @@ This repository is public. Machine-specific paths, private network details,
 relationship-specific operational language, real chat ids, and secret-shaped
 material must stay out of tracked files and future commit messages.
 
+The privacy gate files are vendored byte-identically from `emiltsoi/diploid-agent`:
+`probes/privacy_scan.py`, `probes/privacy-pre-push`, `probes/privacy-ci-scan`, and
+`tests/test_privacy_scan.py`. Do not edit those copies directly in this repository.
+After a canonical change lands in `diploid-agent`, sync and verify it with:
+
+```bash
+python probes/sync_privacy_scan.py --canonical-root /path/to/diploid-agent
+python probes/check_privacy_scan_sync.py --canonical-root /path/to/diploid-agent
+```
+
+Commit the synced files and `probes/privacy-scan-source.json` together. CI checks
+out the pinned canonical commit and verifies that the vendored files are exact.
+
 Install the local pre-push hook once per clone:
 
 ```bash

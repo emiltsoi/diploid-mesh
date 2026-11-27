@@ -20,6 +20,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve privacy scan canonical commit
+        id: privacy-scan-source
+        shell: bash
+        run: |
+          commit=$(python3 -c 'import json; print(json.load(open("probes/privacy-scan-source.json"))["canonical_commit"])')
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: emiltsoi/diploid-agent
+          path: privacy-scan-canonical
+          ref: ${{ steps.privacy-scan-source.outputs.commit }}
+
       - uses: actions/checkout@v4
         with:
           repository: emiltsoi/mesh-peer-registry
@@ -36,38 +49,15 @@ jobs:
 
       - name: Privacy scan
         shell: bash
-        run: |
-          python probes/privacy_scan.py --worktree
-          python probes/privacy_scan.py --github-event "$GITHUB_EVENT_PATH"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            if [ "${{ github.ref_type }}" = "tag" ]; then
-              # github.sha is the peeled commit even for annotated tags. Resolve
-              # the pushed ref itself so tag-object messages are really scanned;
-              # lightweight tags resolve to commits and are correctly clean here.
-              tag_object=$(git rev-parse "${{ github.ref }}" 2>/dev/null || true)
-              if [ -z "$tag_object" ]; then
-                git fetch origin "+${{ github.ref }}:${{ github.ref }}"
-                tag_object=$(git rev-parse "${{ github.ref }}")
-              fi
-              python probes/privacy_scan.py --scan-tag-object "$tag_object"
-              scan_target=$(git rev-parse "${{ github.ref }}^{commit}")
-              before=$(git merge-base "$scan_target" origin/main 2>/dev/null || true)
-            else
-              before="${{ github.event.before }}"
-              scan_target="${{ github.sha }}"
-              if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-                # Orphan branches may have no merge base; then only the tip tree is scanned.
-                before=$(git merge-base "$scan_target" origin/main 2>/dev/null || true)
-              fi
-            fi
-            if [ -n "$before" ]; then
-              python probes/privacy_scan.py --range "$before..$scan_target"
-            else
-              python probes/privacy_scan.py --tree "$scan_target"
-            fi
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            python probes/privacy_scan.py --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-          fi
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash probes/privacy-ci-scan
+
+      - name: Privacy scan sync
+        shell: bash
+        run: python probes/check_privacy_scan_sync.py --canonical-root privacy-scan-canonical
 
       - name: Install dependencies
         run: |

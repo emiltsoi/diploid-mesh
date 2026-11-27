@@ -1,0 +1,11 @@
+{
+  "schema": "privacy-scan-source/v1",
+  "canonical_repository": "emiltsoi/diploid-agent",
+  "canonical_commit": "dca05c0c1502a8671806b9f5b3d75c781e70f1b1",
+  "files": {
+    "probes/privacy_scan.py": "4dd993f8d3b0acba62a7f8c84023e9367fdc08ddabb87be42692fd32880303fe",
+    "probes/privacy-pre-push": "fa8443df17d0d0a80c548e07570df2a89b152a161eb085a756a34de103412860",
+    "probes/privacy-ci-scan": "0b47a3d450dbfe2ea60c1f0a82331745b100ad8eeaf15b5f73803da7c3c1814a",
+    "tests/test_privacy_scan.py": "4a598c87f4ee4acf84efa731c4edc5afaa55c6ab95808c770cbc3dd128d4c104"
+  }
+}

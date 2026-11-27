@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Shared CI privacy gate. The workflow supplies only event-specific SHAs; all
+# scan branching lives here so the same publication surfaces are vetted in
+# every consuming repository.
+
+set -euo pipefail
+
+python probes/privacy_scan.py --worktree
+python probes/privacy_scan.py --github-event "$GITHUB_EVENT_PATH"
+
+if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+    if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+        # github.sha is the peeled commit even for annotated tags. Resolve the
+        # pushed ref itself so tag-object messages are really scanned; lightweight
+        # tags resolve to commits and are correctly clean here.
+        tag_object=$(git rev-parse "${GITHUB_REF}" 2>/dev/null || true)
+        if [ -z "$tag_object" ]; then
+            git fetch origin "+${GITHUB_REF}:${GITHUB_REF}"
+            tag_object=$(git rev-parse "${GITHUB_REF}")
+        fi
+        python probes/privacy_scan.py --scan-tag-object "$tag_object"
+        scan_target=$(git rev-parse "${GITHUB_REF}^{commit}")
+        before=$(git merge-base "$scan_target" origin/main 2>/dev/null || true)
+    else
+        before="${EVENT_BEFORE:-}"
+        scan_target="${GITHUB_SHA}"
+        if [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            # Orphan branches may have no merge base; then only the tip tree is scanned.
+            before=$(git merge-base "$scan_target" origin/main 2>/dev/null || true)
+        fi
+    fi
+    if [ -n "${before:-}" ]; then
+        python probes/privacy_scan.py --range "$before..$scan_target"
+    else
+        python probes/privacy_scan.py --tree "$scan_target"
+    fi
+elif [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+    python probes/privacy_scan.py --range "${PR_BASE_SHA}..${PR_HEAD_SHA}"
+fi

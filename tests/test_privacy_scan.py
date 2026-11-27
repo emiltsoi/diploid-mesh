@@ -236,11 +236,17 @@ def test_ci_trigger_and_privacy_step_cover_tag_pushes() -> None:
 
     steps = data["jobs"]["test"]["steps"]
     privacy = next(step for step in steps if step.get("name") == "Privacy scan")
-    script = privacy["run"]
-    assert "github.ref_type" in script
+    assert privacy["run"] == "bash probes/privacy-ci-scan"
+    assert privacy["env"]["EVENT_BEFORE"] == "${{ github.event.before }}"
+    assert privacy["env"]["PR_BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
+    assert privacy["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+
+    script = (ROOT / "probes" / "privacy-ci-scan").read_text()
     assert '--scan-tag-object "$tag_object"' in script
-    assert "^{commit}" in script
+    assert 'rev-parse "${GITHUB_REF}^{commit}"' in script
     assert "--github-event" in script
+    assert "PR_BASE_SHA" in script
+    assert "PR_HEAD_SHA" in script
 
 
 def test_tracked_tree_is_clean() -> None:
